@@ -23,7 +23,7 @@ This guide provides step-by-step instructions for setting up GNU Radio and Soapy
 Create a new Conda environment for the passive radar project:
 
 ```bash
-conda create -n passive-radar python=3.10
+conda create -n passive-radar "python>=3.10,<3.12"
 ```
 
 Activate the environment:
@@ -140,7 +140,7 @@ name: passive-radar
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
+  - python>=3.10,<3.12
   - gnuradio
   - soapysdr
   - soapysdr-module-all
