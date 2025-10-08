@@ -1,0 +1,11 @@
+name: passive-radar
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - gnuradio
+  - soapysdr
+  - soapysdr-module-all
+  - numpy
+  - scipy
+  - matplotlib
