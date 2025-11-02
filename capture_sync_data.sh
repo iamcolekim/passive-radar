@@ -19,8 +19,8 @@ if [[ -z "$DURATION" ]]; then
 fi
 
 # --- HackRF commands ---
-CMD1='hackrf_transfer -H -d 0000000000000000436c63dc38284c63 -a 0 -l 32 -g 32 -r 63.cs8 -f 99100000'
-CMD2='hackrf_transfer -d 000000000000000066a062dc226b169f -a 0 -l 32 -g 32 -r 9f.cs8 -f 99100000'
+CMD1='hackrf_transfer -H -d 000000000000000066a062dc226b169f -a 0 -l 24 -g 50 -r 63.cs8 -f 500000000 -s 20000000'
+CMD2='hackrf_transfer -d 0000000000000000436c63dc38284c63 -a 0 -l 24 -g 50 -r 9f.cs8 -f 500000000 -s 20000000'
 
 LOG1="63.log"
 LOG2="9f.log"
@@ -136,11 +136,11 @@ fi
 # Default: background mode
 # --------------------------
 echo "Starting both commands in background..."
-setsid bash -lc "$CMD1" > "$LOG1" 2>&1 &
+nohup bash -lc "$CMD1" > "$LOG1" 2>&1 &
 PID1=$!
 pids_to_kill+=("$PID1")
 
-setsid bash -lc "$CMD2" > "$LOG2" 2>&1 &
+nohup bash -lc "$CMD2" > "$LOG2" 2>&1 &
 PID2=$!
 pids_to_kill+=("$PID2")
 
@@ -177,12 +177,6 @@ echo
 echo "=== Final 5 lines from $LOG2 ==="
 tail -n 5 "$LOG2" 2>/dev/null || echo "(no log found)"
 
-# --------------------------
-# Crop output files
-# --------------------------
-echo
-echo "Cropping both .cs8 files to the same length..."
-
 if stat --version >/dev/null 2>&1; then
   SIZE1=$(stat -c%s "$OUT1")
   SIZE2=$(stat -c%s "$OUT2")
@@ -190,28 +184,9 @@ else
   SIZE1=$(stat -f%z "$OUT1")
   SIZE2=$(stat -f%z "$OUT2")
 fi
-
-if (( SIZE1 < SIZE2 )); then
-  MIN_SIZE=$SIZE1
-else
-  MIN_SIZE=$SIZE2
-fi
-# Ensure even byte count
-if (( MIN_SIZE % 2 != 0 )); then
-  ((MIN_SIZE--))
-fi
-
+echo
 echo "  $OUT1: $SIZE1 bytes"
 echo "  $OUT2: $SIZE2 bytes"
-echo "  Cropping both to $MIN_SIZE bytes (=$((MIN_SIZE/2)) samples)."
-
-dd if="$OUT1" of="${OUT1}.tmp" bs=1 count="$MIN_SIZE" status=none
-mv "${OUT1}.tmp" "$OUT1"
-
-dd if="$OUT2" of="${OUT2}.tmp" bs=1 count="$MIN_SIZE" status=none
-mv "${OUT2}.tmp" "$OUT2"
-
-echo "Cropping complete. Both files now equal in length."
 echo
 echo "Done. Files: $OUT1, $OUT2 — Logs: $LOG1, $LOG2"
 
