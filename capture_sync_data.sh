@@ -3,32 +3,47 @@
 # run_hackrf.sh
 # Runs two HackRF transfers in parallel for a fixed duration.
 # Usage:
-#   ./run_hackrf.sh <seconds> [gui]
+#   ./run_hackrf.sh <seconds> <frequency_hz> [gui]
 #
-#   <seconds> : duration to run both transfers
-#   [gui]     : optional, opens two macOS Terminal windows (macOS only)
+#   <seconds>      : duration to run both transfers
+#   <frequency_hz> : center frequency in Hz (e.g., 500000000 for 500MHz)
+#   [gui]          : optional, opens two macOS Terminal windows (macOS only)
 # ========================================
 
 set -euo pipefail
 
 DURATION="${1:-}"
-MODE="${2:-}"
-if [[ -z "$DURATION" ]]; then
-  echo "Usage: $0 DURATION_SECONDS [gui]"
+FREQ_MHZ="${2:-}"
+MODE="${3:-}"
+
+if [[ -z "$DURATION" || -z "$FREQ_MHZ" ]]; then
+  echo "Usage: $0 DURATION_SECONDS FREQUENCY_MHZ [gui]"
+  echo "Example: $0 30 500 gui"
   exit 1
 fi
 
-# --- HackRF commands ---
-CMD1='hackrf_transfer -H -d 000000000000000066a062dc226b169f -a 0 -l 24 -g 50 -r 63.cs8 -f 500000000 -s 20000000'
-CMD2='hackrf_transfer -d 0000000000000000436c63dc38284c63 -a 0 -l 24 -g 50 -r 9f.cs8 -f 500000000 -s 20000000'
+# Convert MHz input to Hz for HackRF
+FREQUENCY=$((FREQ_MHZ * 1000000))
 
-LOG1="63.log"
-LOG2="9f.log"
-OUT1="63.cs8"
-OUT2="9f.cs8"
+# Generate timestamp in readable format: Nov04_1430 or Nov04_0215
+TIMESTAMP=$(date +"%b%d_%H%M")
 
-# Clean up any old files
-rm -f "$LOG1" "$LOG2" "$OUT1" "$OUT2"
+# Generate unique filenames
+LOG1="63_${FREQ_MHZ}MHz_${TIMESTAMP}.log"
+LOG2="9f_${FREQ_MHZ}MHz_${TIMESTAMP}.log"
+OUT1="63_${FREQ_MHZ}MHz_${TIMESTAMP}.cs8"
+OUT2="9f_${FREQ_MHZ}MHz_${TIMESTAMP}.cs8"
+
+# --- HackRF commands with frequency parameter ---
+CMD1="hackrf_transfer -H -d 000000000000000066a062dc226b169f -a 0 -l 24 -g 50 -r $OUT1 -f $FREQUENCY -s 20000000"
+CMD2="hackrf_transfer -d 0000000000000000436c63dc38284c63 -a 0 -l 24 -g 50 -r $OUT2 -f $FREQUENCY -s 20000000"
+
+echo "Output files will be:"
+echo "  Device 63: $OUT1 (log: $LOG1)"
+echo "  Device 9f: $OUT2 (log: $LOG2)"
+echo "  Frequency: $FREQ_MHZ MHz"
+echo "  Duration: $DURATION seconds"
+echo
 
 # Track PIDs for cleanup
 pids_to_kill=()
@@ -60,8 +75,8 @@ esac
 if [[ "$MODE" == "gui" && "$is_macos" == true ]]; then
   echo "Opening two new Terminal windows and launching commands (macOS)..."
 
-  TERM_CMD1="rm -f $LOG1 $OUT1; $CMD1 > $LOG1 2>&1"
-  TERM_CMD2="rm -f $LOG2 $OUT2; $CMD2 > $LOG2 2>&1"
+  TERM_CMD1="$CMD1 > $LOG1 2>&1"
+  TERM_CMD2="$CMD2 > $LOG2 2>&1"
 
   osascript <<EOF
 tell application "Terminal"
@@ -115,7 +130,7 @@ EOF
   else
     MIN_SIZE=$SIZE2
   fi
-  (( MIN_SIZE %= 2 == 0 )) || ((MIN_SIZE--))
+  (( MIN_SIZE % 2 == 0 )) || ((MIN_SIZE--))
 
   echo "  $OUT1: $SIZE1 bytes"
   echo "  $OUT2: $SIZE2 bytes"
@@ -189,217 +204,3 @@ echo "  $OUT1: $SIZE1 bytes"
 echo "  $OUT2: $SIZE2 bytes"
 echo
 echo "Done. Files: $OUT1, $OUT2 — Logs: $LOG1, $LOG2"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
