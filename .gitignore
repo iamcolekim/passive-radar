@@ -7,6 +7,10 @@
 #personal stuff:
 personal/
 
+#large-files for gnu-radio
+*.cs8
+*.f32
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
