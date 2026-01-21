@@ -7,6 +7,9 @@
 #personal stuff:
 personal/
 
+#test outputs:
+tests/artifacts/*
+
 #large-files for gnu-radio
 *.cs8
 *.f32
