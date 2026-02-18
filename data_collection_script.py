@@ -88,7 +88,15 @@ def align_signals(x, y, lag):
 # ---- USER INPUT ----
 freq_mhz = float(input("Enter frequency (MHz): "))
 duration = float(input("Enter duration (seconds): "))
+samp_rate = float(input("Enter sampling rate (MSps): "))
+gain_lna = input("Enter LNA gain (dB, steps of 8): ")
+if (gain_lna == ""): 
+    gain_lna = "16"
+gain_vga = input("Enter VGA gain (db, steps of 2): ")
+if (gain_vga == ""):
+    gain_vga = "16"
 
+print("gain settings: lna = ", gain_lna,", vga =", gain_vga, "\n")
 # Convert to Hz
 frequency = int(freq_mhz * 1_000_000)
 
@@ -111,11 +119,11 @@ cmd_master = [
     "hackrf_transfer",
     "-d", SERIAL_MASTER,
     "-a", "0",
-    "-l", "24",
-    "-g", "50",
+    "-l", gain_lna,
+    "-g", gain_vga,
     "-r", out2,
     "-f", str(frequency),
-    "-s", "20000000"
+    "-s", str(samp_rate * 1_000_000)
 ]
 
 cmd_slave = [
@@ -123,13 +131,24 @@ cmd_slave = [
     "-H",
     "-d", SERIAL_SLAVE,
     "-a", "0",
-    "-l", "24",
-    "-g", "50",
+    "-l", gain_lna,
+    "-g", gain_vga,
     "-r", out1,
     "-f", str(frequency),
-    "-s", "20000000"
+    "-s", str(samp_rate * 1_000_000)
 ]
 
+clk_master = [
+    "hackrf_clock",
+    "-d", SERIAL_MASTER,
+    "-o", "1"
+]
+
+clk_slave = [
+    "hackrf_clock",
+    "-d", SERIAL_SLAVE,
+    "-i"
+]
 # ---- PROCESS HANDLER ----
 def run_hackrf(cmd, logfile):
     with open(logfile, "w") as log:
@@ -140,12 +159,17 @@ def run_hackrf(cmd, logfile):
             text=True
         )
 
+
 # ---- START RECORDING ----
 print("Starting HackRF recordings...")
 
-p1 = run_hackrf(cmd_slave, log1)
+p0 = run_hackrf(clk_master, log2)
+time.sleep(0.2)
+p1 = run_hackrf(clk_slave, log1)
+time.sleep(0.2)
+p2 = run_hackrf(cmd_slave, log1)
 time.sleep(0.2)  # ensure slave starts first
-p2 = run_hackrf(cmd_master, log2)
+p3 = run_hackrf(cmd_master, log2)
 
 # ---- RUN FOR DURATION ----
 time.sleep(duration)
@@ -153,11 +177,15 @@ time.sleep(duration)
 # ---- STOP RECORDING ----
 print("Stopping HackRF recordings...")
 
+p0.terminate()
 p1.terminate()
 p2.terminate()
+p3.terminate()
 
+p0.wait()
 p1.wait()
 p2.wait()
+p3.wait()
 
 print("Loading first 1M samples + clipping stats...")
 
