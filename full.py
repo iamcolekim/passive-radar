@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 
 from numba import njit
+from tqdm import tqdm
 
 
 def read_cs8_block(f, n_complex: int):
@@ -33,6 +34,164 @@ def xcorr_fft(a, b):
     r = np.fft.ifft(np.fft.fft(a, nfft) * np.conj(np.fft.fft(b, nfft)))
     return np.concatenate((r[nfft - (n - 1): nfft], r[:n]))
 
+
+# --------------------------
+# Added: initial offset handling (correlate-style)
+# --------------------------
+
+def next_pow2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+def linear_xcorr_fft(x: np.ndarray, y: np.ndarray, nfft: int) -> np.ndarray:
+    """
+    Linear cross-correlation using FFT.
+    Returns lags from -(N-1) ... (N-1), length (2N-1).
+    """
+    N = len(x)
+    X = np.fft.fft(x, nfft)
+    Y = np.fft.fft(y, nfft)
+    r_circ = np.fft.ifft(X * np.conj(Y))
+    pos = r_circ[:N]          # lag 0..N-1
+    neg = r_circ[-(N - 1):]   # lag -(N-1)..-1
+    return np.concatenate([neg, pos])
+
+def file_num_complex_samples(path: str) -> int:
+    return os.path.getsize(path) // 2
+
+def read_cs8_iq(path: str, start_samp: int, num_samp: int) -> np.ndarray:
+    offset_bytes = start_samp * 2
+    count_i8 = num_samp * 2
+    with open(path, "rb") as f:
+        f.seek(offset_bytes, os.SEEK_SET)
+        raw = np.fromfile(f, dtype=np.int8, count=count_i8)
+    if raw.size < count_i8:
+        raw = np.pad(raw, (0, count_i8 - raw.size), mode="constant")
+    i = raw[0::2].astype(np.float32)
+    q = raw[1::2].astype(np.float32)
+    return ((i + 1j * q) / 128.0).astype(np.complex64)
+
+def estimate_initial_delay_samples(ref_path: str,
+                                  sur_path: str,
+                                  block_size: int = 32768,
+                                  max_complex_samples: int = 1_000_000) -> int:
+    """
+    Estimate integer lag (samples) between ref and sur near the start of the files.
+    Uses multiple blocks and returns the MODE of peak lags.
+
+    Convention for returned lag:
+      - lag < 0 => sur is delayed vs ref by -lag samples
+      - lag > 0 => sur leads ref by +lag samples
+    """
+    n_total = min(file_num_complex_samples(ref_path), file_num_complex_samples(sur_path))
+    usable = min(n_total, max_complex_samples)
+    n_blocks = usable // block_size
+    if n_blocks < 1:
+        return 0
+
+    nfft = next_pow2(2 * block_size - 1)
+    lags = np.arange(-(block_size - 1), block_size, dtype=np.int32)
+
+    peak_lags = []
+    for bi in range(n_blocks):
+        start = bi * block_size
+        x = read_cs8_iq(ref_path, start, block_size)
+        y = read_cs8_iq(sur_path, start, block_size)
+
+        x = x - np.mean(x)
+        y = y - np.mean(y)
+
+        r = linear_xcorr_fft(x, y, nfft)
+        mag = np.abs(r).astype(np.float32)
+        mag /= (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12)
+
+        peak_idx = int(np.argmax(mag))
+        peak_lags.append(int(lags[peak_idx]))
+
+    peak_lags = np.array(peak_lags, dtype=np.int32)
+    offset = -int(lags.min())
+    counts = np.bincount(peak_lags + offset)
+    mode_lag = int(np.argmax(counts) - offset)
+    return mode_lag
+
+def estimate_delay_from_open_files(fx,
+                                   fy,
+                                   block_size: int = 32768,
+                                   max_complex_samples: int = 1_000_000) -> int:
+    """
+    Estimate integer lag (samples) between ref and sur using data starting
+    from the CURRENT file positions of already-open file handles.
+
+    Convention:
+      - lag < 0 => sur is delayed vs ref by -lag samples
+      - lag > 0 => sur leads ref by +lag samples
+    """
+    # Save current positions
+    pos_x = fx.tell()
+    pos_y = fy.tell()
+
+    try:
+        # Available complex samples from current positions
+        avail_x = (os.fstat(fx.fileno()).st_size - pos_x) // 2
+        avail_y = (os.fstat(fy.fileno()).st_size - pos_y) // 2
+        usable = min(avail_x, avail_y, max_complex_samples)
+
+        n_blocks = usable // block_size
+        if n_blocks < 1:
+            return 0
+
+        nfft = next_pow2(2 * block_size - 1)
+        lags = np.arange(-(block_size - 1), block_size, dtype=np.int32)
+
+        peak_lags = []
+        for _ in range(n_blocks):
+            x = read_cs8_block(fx, block_size)
+            y = read_cs8_block(fy, block_size)
+            if x is None or y is None:
+                break
+
+            x = x - np.mean(x)
+            y = y - np.mean(y)
+
+            r = linear_xcorr_fft(x, y, nfft)
+            mag = np.abs(r).astype(np.float32)
+            mag /= (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12)
+
+            peak_idx = int(np.argmax(mag))
+            peak_lags.append(int(lags[peak_idx]))
+
+        if len(peak_lags) == 0:
+            return 0
+
+        peak_lags = np.array(peak_lags, dtype=np.int32)
+        offset = -int(lags.min())
+        counts = np.bincount(peak_lags + offset)
+        mode_lag = int(np.argmax(counts) - offset)
+        return mode_lag
+
+    finally:
+        # Restore positions so this estimate does not consume data
+        fx.seek(pos_x, os.SEEK_SET)
+        fy.seek(pos_y, os.SEEK_SET)
+
+
+def apply_relative_file_shift(fx, fy, lag_samples: int):
+    """
+    Apply integer-sample correction at the CURRENT file positions.
+
+    lag_samples convention:
+      - lag < 0 => sur delayed vs ref by -lag => advance SUR
+      - lag > 0 => sur leads ref by +lag => advance REF
+    """
+    if lag_samples < 0:
+        shift = -lag_samples
+        fy.seek(shift * 2, os.SEEK_CUR)
+        print(f"  Applying periodic correction: shifting SUR forward by {shift} samples")
+    elif lag_samples > 0:
+        shift = lag_samples
+        fx.seek(shift * 2, os.SEEK_CUR)
+        print(f"  Applying periodic correction: shifting REF forward by {shift} samples")
+    else:
+        print("  Applying periodic correction: none (lag=0)")
 
 @njit(cache=True)
 def nlms_block(x, d, w, mu, eps):
@@ -78,21 +237,21 @@ def nlms_block(x, d, w, mu, eps):
     return y_hat, e, w
 
 
-def save_correlation_mp4(x_lag_us, before_frames, after_frames, out_path, fps):
+def save_correlation_mp4(x_axis_m, before_frames, after_frames, out_path, fps):
     fig, ax = plt.subplots(figsize=(7, 7))
     (l1,) = ax.plot([], [], label="Before NLMS")
     (l2,) = ax.plot([], [], label="After NLMS")
 
-    ax.set_xlim(-100, 100)
-    ax.set_ylim(-200, 200)
-    ax.set_xlabel("Lag (µs)")
+    ax.set_xlim(-500, 500)
+    ax.set_ylim(-20, 200000)
+    ax.set_xlabel("Range (m, approx from lag)")
     ax.set_ylabel("Correlation (dB)")
     ax.legend()
     ax.grid(True)
 
     def upd(i):
-        l1.set_data(x_lag_us, before_frames[i])
-        l2.set_data(x_lag_us, after_frames[i])
+        l1.set_data(x_axis_m, before_frames[i])
+        l2.set_data(x_axis_m, after_frames[i])
         ax.set_title(f"Correlation Block {i+1}")
         return l1, l2
 
@@ -102,131 +261,192 @@ def save_correlation_mp4(x_lag_us, before_frames, after_frames, out_path, fps):
     plt.close(fig)
 
 
-def save_caf_mp4(caf_corr, x_lag_us, Nslow, Tblock, out_path, fps):
+def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps):
     """
     Builds Range–Doppler CAF frames from caf_corr (list of complex correlation vectors)
-    and saves an MP4. Matches original behavior:
+    and saves an MP4 without storing all frames in memory.
+
+    Behavior:
       - sliding window of Nslow
       - FFT over slow-time axis
       - fftshift
+      - Doppler crop
       - dB magnitude
     """
+    if len(caf_corr) < Nslow:
+        print(f"Not enough blocks for CAF: have {len(caf_corr)}, need Nslow={Nslow}. Skipping CAF MP4.")
+        return
+
     doppler_axis = np.fft.fftshift(np.fft.fftfreq(Nslow, d=Tblock))
 
-    caf_frames = []
-    for i in range(Nslow - 1, len(caf_corr)):
-        S = np.stack(caf_corr[i - (Nslow - 1): i + 1], axis=0)
-        RD = np.fft.fftshift(np.fft.fft(S, axis=0), axes=0)
-        caf_frames.append(20 * np.log10(np.abs(RD) + 1e-12))
+    # Doppler zoom to +/- 60 Hz
+    MAX_DOPPLER_HZ = 60.0
+    dmask = np.abs(doppler_axis) <= MAX_DOPPLER_HZ
+    doppler_zoom = doppler_axis[dmask]
+
+    n_caf_frames = len(caf_corr) - Nslow + 1
+    frame_step = 5  # keep every 10th frame in the video
+
+    # Build first frame so we can initialize imshow
+    S0 = np.stack(caf_corr[0:Nslow], axis=0)
+    RD0 = np.fft.fftshift(np.fft.fft(S0, axis=0), axes=0)
+    RD0 = RD0[dmask, :]
+    frame0 = (20 * np.log10(np.abs(RD0) + 1e-12)).astype(np.float32)
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    extent = [x_lag_us[0], x_lag_us[-1], doppler_axis[0], doppler_axis[-1]]
+    extent = [x_axis_m[0], x_axis_m[-1], doppler_zoom[0], doppler_zoom[-1]]
 
     im = ax.imshow(
-        caf_frames[0],
+        frame0,
         origin="lower",
         aspect="auto",
         extent=extent,
     )
 
-    ax.set_xlabel("Lag (µs)")
+    ax.set_xlabel("Range (m, approx from lag)")
     ax.set_ylabel("Doppler (Hz)")
     ax.set_title("Range–Doppler CAF (After NLMS)")
 
-    def upd(i):
-        im.set_data(caf_frames[i])
-        ax.set_title(f"Range–Doppler CAF (Frame {i+1})")
-        return (im,)
+    writer = FFMpegWriter(fps=fps)
 
-    FuncAnimation(fig, upd, frames=len(caf_frames), blit=True).save(
-        out_path, writer=FFMpegWriter(fps=fps)
-    )
+    with writer.saving(fig, out_path, dpi=100):
+        for i in tqdm(
+            range(Nslow - 1, len(caf_corr), frame_step),
+            total=(n_caf_frames + frame_step - 1) // frame_step,
+            desc="Building CAF frames",
+        ):
+            S = np.stack(caf_corr[i - (Nslow - 1): i + 1], axis=0)
+            RD = np.fft.fftshift(np.fft.fft(S, axis=0), axes=0)
+            RD = RD[dmask, :]  # crop Doppler
+            frame_db = (20 * np.log10(np.abs(RD) + 1e-12)).astype(np.float32)
+
+            im.set_data(frame_db)
+            writer.grab_frame()
+
     plt.close(fig)
 
-
 def main():
-    fid_x_path = "/Users/ibrahimsweidan/Downloads/drive-download-20260117T214613Z-3-001/63_99.1MHz_20260117_161719.cs8"
-    fid_y_path = "/Users/ibrahimsweidan/Downloads/drive-download-20260117T214613Z-3-001/63_99.1MHz_20260117_161719.cs8"
+    fid_x_path = "/Users/ibrahimsweidan/Downloads/509.0MHz_20260217_184044/ref.cs8"
+    fid_y_path = "/Users/ibrahimsweidan/Downloads/509.0MHz_20260217_184044/sur.cs8"
     if not os.path.exists(fid_x_path):
         raise FileNotFoundError("Input file not found")
 
-    length = 2**15
+    length = 2 * 4096
     Fs = 10e6
 
-    Nslow = 50
-    L = 2**14
-    mu = 0.6
+    Nslow = 1000
+    L = 1
+    mu = 0.1
     eps = 1e-6
 
-    adapt_blocks = 100
-    max_record = 150
-
-    delay_samp = 350
-    doppler_hz = 30.0
-    atten = 0.008
-
-    fps = 20
+    fps = 1000
     corr_mp4 = "PassiveRadar_Correlation.mp4"
     caf_mp4 = "PassiveRadar_RangeDoppler_CAF.mp4"
 
-    lags_us = (np.arange(-(length - 1), length) / Fs) * 1e6
-    t = np.arange(length, dtype=np.float32) / Fs
-    doppler_phasor = np.exp(1j * 2 * np.pi * doppler_hz * t).astype(np.complex64)
+    # Re-check offset about once per second of data
+    seconds_per_recheck = 1.0
+    blocks_per_recheck = max(1, int(round(seconds_per_recheck * Fs / length)))
+
+    # Use ~1 second of data for the offset estimator too
+    recheck_window_samples = int(Fs * 1.0)
+    recheck_corr_block_size = 32768
+
+    # Optional: ignore tiny jittery corrections
+    min_recheck_shift_samples = 2
+
+    # Added: fast-time Hann window for correlation
+    win = np.hanning(length).astype(np.float32)
 
     w = np.zeros(L, dtype=np.complex64)
-    R_before_db = [None] * max_record
-    R_after_db = [None] * max_record
-    R_after_cplx = [None] * max_record
+    R_after_cplx = []
 
-    step_size = 0
     Tblock = length / Fs
 
+    # --- Estimate & apply initial file offset ---
+    lag0 = estimate_initial_delay_samples(fid_x_path, fid_y_path)
+    ref_off = max(0, lag0)
+    sur_off = max(0, -lag0)
+
+    print(f"Estimated start delay (ref vs sur) lag: {lag0} samples  ({lag0 / Fs:.6f} s)")
+    if lag0 < 0:
+        print(f"Applying correction: shifting SUR forward by {sur_off} samples")
+    elif lag0 > 0:
+        print(f"Applying correction: shifting REF forward by {ref_off} samples")
+    else:
+        print("Applying correction: none (lag=0)")
+
+    # Cap max_record to available full blocks after initial offsets
+    n_ref = file_num_complex_samples(fid_x_path) - ref_off
+    n_sur = file_num_complex_samples(fid_y_path) - sur_off
+    n_avail = min(n_ref, n_sur)
+    max_blocks = int(n_avail // length)
+    if max_blocks <= 0:
+        raise RuntimeError("No full blocks available after applying initial offset.")
+
     with open(fid_x_path, "rb") as fx, open(fid_y_path, "rb") as fy:
-        for bi in range(1, max_record + 1):
-            x = read_cs8_block(fx, length)
-            y = read_cs8_block(fy, length)
-            if x is None or y is None:
-                break
+        # Apply initial offset
+        if ref_off:
+            fx.seek(ref_off * 2, os.SEEK_SET)
+        if sur_off:
+            fy.seek(sur_off * 2, os.SEEK_SET)
 
-            x -= x.mean()
-            y -= y.mean()
+        bi = 0
+        with tqdm(total=max_blocks, desc="Processing blocks") as pbar:
+            while True:
+                # Periodic offset re-check
+                if bi > 0 and (bi % blocks_per_recheck == 0):
+                    lag_now = estimate_delay_from_open_files(
+                        fx,
+                        fy,
+                        block_size=recheck_corr_block_size,
+                        max_complex_samples=recheck_window_samples,
+                    )
 
-            if bi > adapt_blocks:
-                if step_size > Nslow:
-                    step_size = 0
-                    delay_samp += 50
-                step_size += 1
+                    print(
+                        f"\nPeriodic offset check at block {bi}: "
+                        f"lag = {lag_now} samples ({lag_now / Fs:.6f} s)"
+                    )
 
-                y_delayed = np.zeros_like(x)
-                y_delayed[delay_samp:] = x[:-delay_samp]
+                    if abs(lag_now) >= min_recheck_shift_samples:
+                        apply_relative_file_shift(fx, fy, lag_now)
+                    else:
+                        print("  Skipping correction: lag below threshold")
 
-                phase0 = np.exp(1j * 2 * np.pi * doppler_hz * (bi - 1) * Tblock).astype(
-                    np.complex64
-                )
-                y += atten * y_delayed * doppler_phasor * phase0
+                x = read_cs8_block(fx, length)
+                y = read_cs8_block(fy, length)
+                if x is None or y is None:
+                    break
 
-            _, y_clean, w = nlms_block(x, y, w, mu, eps)
+                x -= x.mean()
+                y -= y.mean()
 
-            Rb = xcorr_fft(x, y)
-            Ra = xcorr_fft(x, y_clean)
+                _, y_clean, w = nlms_block(x, y, w, mu, eps)
 
-            idx = bi - 1
-            R_before_db[idx] = 20 * np.log10(np.abs(Rb) + 1e-12)
-            R_after_db[idx] = 20 * np.log10(np.abs(Ra) + 1e-12)
-            R_after_cplx[idx] = Ra.astype(np.complex64)
+                # Apply Hann window before correlation
+                xw = x * win
+                yw = y_clean * win
 
-    mask = (lags_us >= -100) & (lags_us <= 100)
-    x_crop = lags_us[mask]
+                Ra = xcorr_fft(yw, xw)
+                R_after_cplx.append(Ra.astype(np.complex64))
 
-    before_frames, after_frames, caf_corr = [], [], []
-    for k in range(max_record):
-        if R_before_db[k] is None:
-            break
-        before_frames.append(R_before_db[k][mask])
-        after_frames.append(R_after_db[k][mask])
+                bi += 1
+                pbar.update(1)
+
+    if len(R_after_cplx) == 0:
+        raise RuntimeError("No processed blocks produced any CAF data.")
+
+    # --- Convert lag axis -> range (meters), and crop to 0..1000 m ---
+    c = 299_792_458.0
+    lags_s = np.arange(-(length - 1), length) / Fs
+    range_m = c * lags_s / 2.0
+
+    mask = (range_m >= 0.0) & (range_m <= 1000.0)
+    x_crop = range_m[mask]
+
+    caf_corr = []
+    for k in range(len(R_after_cplx)):
         caf_corr.append(R_after_cplx[k][mask])
 
-    save_correlation_mp4(x_crop, before_frames, after_frames, corr_mp4, fps)
     save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps)
 
     print("Finished:")
