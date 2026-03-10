@@ -219,7 +219,7 @@ def nlms_block(x, d, w, mu, eps):
                 p = L - 1
 
         y_hat[n] = y
-        err = d[n] - y
+        err = d[n] - 0.005*y
         e[n] = err
 
         g = (mu / (norm + eps)) * np.conj(err)
@@ -236,6 +236,134 @@ def nlms_block(x, d, w, mu, eps):
 
     return y_hat, e, w
 
+def wiener_block(x, d, reg=1e-3):
+    """
+    Drop-in Wiener canceller with:
+      - power-normalized regularization (reg becomes dimensionless)
+      - mild smoothing of H(f) across blocks (persistent internal state)
+
+    Call signature unchanged: wiener_block(x, d, reg)
+    Returns unchanged: y_hat, e, state_dict
+    """
+
+    # --- persistent state stored as function attributes (no wrapper/main changes needed) ---
+    if not hasattr(wiener_block, "_H_prev") or wiener_block._H_prev is None:
+        wiener_block._H_prev = None
+
+    # Smoothing factor (fixed here since you don't want to change wrapper/main)
+    alpha = 0.95   # 0.90..0.98 (higher = smoother, fewer bursts)
+
+    eps = 1e-12
+    N = d.size
+    X = np.fft.fft(x, n=N)
+    D = np.fft.fft(d, n=N)
+
+    Sxx = (X * np.conj(X)).real          # |X|^2
+    Sdx = D * np.conj(X)                 # D X*
+
+    # --- power-normalized diagonal loading ---
+    # reg is now dimensionless; effective loading scales with average reference power
+    pxx = float(np.mean(Sxx)) + eps
+    reg_eff = float(reg) * pxx
+
+    H_new = Sdx / (Sxx + reg_eff)
+
+    # --- smooth across blocks to reduce "bursty" artifacts ---
+    H_prev = wiener_block._H_prev
+    if H_prev is None or H_prev.shape != H_new.shape:
+        H = H_new
+    else:
+        H = alpha * H_prev + (1.0 - alpha) * H_new
+
+    wiener_block._H_prev = H.astype(np.complex64)
+
+    Yhat = np.fft.ifft(H * X).astype(np.complex64)
+    e = (d - Yhat).astype(np.complex64)
+
+    # Return extra debug info (ignored by your pipeline unless you use it)
+    return Yhat, e, {"H": H.astype(np.complex64), "reg_eff": reg_eff, "pxx": pxx, "alpha": alpha}
+
+
+def eca_block(x, d, K=32, delay0=0):
+    """
+    Time-domain ECA (Extended Cancellation Algorithm) via least squares.
+    Builds a tap-delay matrix from x and solves min_w ||d - Xmat w||.
+
+    K:     number of taps (columns)
+    delay0: starting delay in samples (>=0). Use delay0>0 to avoid self-leakage at 0 lag.
+    Returns: y_hat, e, state
+    """
+    N = d.size
+    if delay0 < 0:
+        raise ValueError("delay0 must be >= 0")
+    if K < 1:
+        raise ValueError("K must be >= 1")
+    if delay0 + K > N:
+        # Not enough samples in this block to build the matrix
+        return np.zeros_like(d), d.copy(), {"w": np.zeros(K, dtype=np.complex64)}
+
+    # Build Xmat: each column is a delayed version of x
+    # Xmat[n, k] = x[n - (delay0 + k)]  (with valid indices only)
+    Xmat = np.empty((N, K), dtype=np.complex64)
+    Xmat[:] = 0.0 + 0.0j
+
+    for k in range(K):
+        sh = delay0 + k
+        Xmat[sh:, k] = x[: N - sh]
+
+    # Least squares solve (complex)
+    w, _, _, _ = np.linalg.lstsq(Xmat, d, rcond=None)
+    y_hat = (Xmat @ w).astype(np.complex64)
+    e = (d - y_hat).astype(np.complex64)
+
+    return y_hat, e, {"w": w.astype(np.complex64)}
+
+
+def clutter_cancel_block(x, d, state, method, params):
+    """
+    Unified clutter canceller wrapper.
+
+    Inputs:
+      x: ref block (complex)
+      d: sur block (complex)
+      state: dict (can be None on first call)
+      method: "nlms" | "wiener" | "eca"
+      params: dict of method-specific params
+
+    Returns:
+      y_hat, e_clean, new_state
+    """
+    if state is None:
+        state = {}
+
+    method = method.lower()
+
+    if method == "nlms":
+        # Reuse your existing nlms_block and its weight vector w
+        w = state.get("w", None)
+        if w is None:
+            L = int(params.get("L", 1))
+            w = np.zeros(L, dtype=np.complex64)
+
+        mu = float(params.get("mu", 0.1))
+        eps = float(params.get("eps", 1e-6))
+
+        y_hat, e, w = nlms_block(x, d, w, mu, eps)
+        return y_hat, e, {"w": w}
+
+    elif method == "wiener":
+        reg = float(params.get("reg", 1e-3))
+        y_hat, e, st = wiener_block(x, d, reg=reg)
+        return y_hat, e, st
+
+    elif method == "eca":
+        K = int(params.get("K", 32))
+        delay0 = int(params.get("delay0", 0))
+        y_hat, e, st = eca_block(x, d, K=K, delay0=delay0)
+        return y_hat, e, st
+
+    else:
+        raise ValueError(f"Unknown method '{method}'. Use 'nlms', 'wiener', or 'eca'.")
 
 def save_correlation_mp4(x_axis_m, before_frames, after_frames, out_path, fps):
     fig, ax = plt.subplots(figsize=(7, 7))
@@ -335,9 +463,28 @@ def main():
     Fs = 10e6
 
     Nslow = 1000
-    L = 1
+    L = 80
     mu = 0.1
     eps = 1e-6
+
+    CANCEL_METHOD = "nlms"   # "nlms" | "wiener" | "eca"
+
+    cancel_params = {
+        # NLMS params
+        "L": L,
+        "mu": mu,
+        "eps": eps,
+
+        # Wiener params (only used if method=="wiener")
+        "reg": 1e-2,
+
+        # ECA params (only used if method=="eca")
+        "K": 3,
+        "delay0": 0,
+    }
+
+    cancel_state = None
+
 
     fps = 1000
     corr_mp4 = "PassiveRadar_Correlation.mp4"
@@ -420,11 +567,13 @@ def main():
                 x -= x.mean()
                 y -= y.mean()
 
-                _, y_clean, w = nlms_block(x, y, w, mu, eps)
+                _, y_clean, cancel_state = clutter_cancel_block(
+                    x, y, cancel_state, CANCEL_METHOD, cancel_params
+                )
 
                 # Apply Hann window before correlation
-                xw = x * win
-                yw = y_clean * win
+                xw = x 
+                yw = y_clean 
 
                 Ra = xcorr_fft(yw, xw)
                 R_after_cplx.append(Ra.astype(np.complex64))
