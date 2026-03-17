@@ -17,6 +17,9 @@ from matplotlib.animation import FuncAnimation, FFMpegWriter
 from numba import njit
 from tqdm import tqdm
 
+# User Imports
+from obj_tracking import SimpleTracker
+
 
 def read_cs8_block(f, n_complex: int):
     raw = np.fromfile(f, dtype=np.int8, count=2 * n_complex)
@@ -389,7 +392,7 @@ def save_correlation_mp4(x_axis_m, before_frames, after_frames, out_path, fps):
     plt.close(fig)
 
 
-def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps):
+def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None):
     """
     Builds Range–Doppler CAF frames from caf_corr (list of complex correlation vectors)
     and saves an MP4 without storing all frames in memory.
@@ -435,6 +438,10 @@ def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps):
     ax.set_ylabel("Doppler (Hz)")
     ax.set_title("Range–Doppler CAF (After NLMS)")
 
+    # a marker to represent our Kalman Filter estimate
+    tracker_point, = ax.plot([], [], 'ro', markersize=12, markeredgewidth=3, label='Kalman Track')
+    ax.legend(loc="upper right")
+
     writer = FFMpegWriter(fps=fps)
 
     with writer.saving(fig, out_path, dpi=100):
@@ -446,16 +453,37 @@ def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps):
             S = np.stack(caf_corr[i - (Nslow - 1): i + 1], axis=0)
             RD = np.fft.fftshift(np.fft.fft(S, axis=0), axes=0)
             RD = RD[dmask, :]  # crop Doppler
+            
+            # Genearte visual frame (db)
             frame_db = (20 * np.log10(np.abs(RD) + 1e-12)).astype(np.float32)
 
             im.set_data(frame_db)
+
+            # run tracker logic
+            if tracker is not None:
+                caf_power = np.abs(RD.T)**2 
+                
+                # Find the exact index of 0 Hz in the cropped array
+                d_zero_idx = int(np.argmin(np.abs(doppler_zoom)))
+                
+                track_res = tracker.process_caf_frame(caf_power, i, doppler_0_idx=d_zero_idx)
+                
+                if track_res['active']:
+                    # Pluck the SI units directly from the physics state
+                    r_meters = track_res['state']['bistatic_range_m']
+                    d_hz = track_res['state']['doppler_hz']
+                    
+                    # Plot the hollow red dot
+                    tracker_point.set_data([r_meters], [d_hz])
+                else:
+                    tracker_point.set_data([], []) # Hide marker if lost
             writer.grab_frame()
 
     plt.close(fig)
 
 def main():
-    fid_x_path = "/Users/ibrahimsweidan/Downloads/509.0MHz_20260217_184044/ref.cs8"
-    fid_y_path = "/Users/ibrahimsweidan/Downloads/509.0MHz_20260217_184044/sur.cs8"
+    fid_x_path = "/Users/colekim/Documents/Y4_Work/Capstone/DevWork/509.0MHz_20260217_184044/ref.cs8"
+    fid_y_path = "/Users/colekim/Documents/Y4_Work/Capstone/DevWork/509.0MHz_20260217_184044/surv.cs8"
     if not os.path.exists(fid_x_path):
         raise FileNotFoundError("Input file not found")
 
@@ -595,8 +623,10 @@ def main():
     caf_corr = []
     for k in range(len(R_after_cplx)):
         caf_corr.append(R_after_cplx[k][mask])
-
-    save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps)
+    
+    # Instantiate a tracker and pass it to the CAF MP4 generator
+    target_tracker = SimpleTracker(fs=Fs, N=Nslow, fc=509e6, Tblock=Tblock)
+    save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps, tracker=target_tracker)
 
     print("Finished:")
     print(" ", corr_mp4)

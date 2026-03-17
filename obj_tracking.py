@@ -171,47 +171,29 @@ class KalmanTracker:
         fs: float,
         N: int,
         fc: float,
+        Tblock: float,  # <--- ADDED TBLOCK
         delay_0_idx: float = 0,
         doppler_0_idx: float | None = None,
     ) -> Dict[str, float]:
-        """
-        Converts internal bin-tracking state to SI units.
+        c = 299_792_458.0
         
-        Parameters:
-        - fs: Sample Rate (Hz)
-        - N: Block Size (Number of Doppler bins)
-        - fc: Carrier Frequency (Hz) (e.g., 509e6)
-        - delay_0_idx: Which row index corresponds to 0 delay? (Usually 0)
-        - doppler_0_idx: Which col index corresponds to 0 Hz? (Usually N/2 for centered plots)
-        
-        Returns:
-        - dict with 'bistatic_range_m', 'doppler_hz', 'velocity_m_s'
-        """
-        c = 299_792_458 # Speed of light (m/s)
-        
-        # 1. Extract raw bin positions from state vector
         r_bin = self.x[0]
         d_bin = self.x[2]
         
-        # 2. Convert Range Bin -> Bistatic Range (Meters)
-        # Time Delay = (Bin - 0_offset) / fs
-        # Distance = Time * c
+        # Bistatic Range (/ 2.0 added)
         delay_samples = r_bin - delay_0_idx
-        range_m = (delay_samples / fs) * c
+        range_m = ((delay_samples / fs) * c) / 2.0 
         
-        # 3. Convert Doppler Bin -> Frequency Shift (Hz)
-        # Resolution = fs / N
         if doppler_0_idx is None:
-            doppler_0_idx = N / 2  # Assume centered convention
+            doppler_0_idx = N / 2
             
         doppler_shift_bins = d_bin - doppler_0_idx
-        doppler_hz = doppler_shift_bins * (fs / N)
         
-        # 4. Convert Doppler (Hz) -> Bistatic Velocity (m/s)
-        # Standard Radar Equation: fd = (2 * v) / lambda
-        # Therefore: v = (fd * lambda) / 2
+        # CORRECT Passive Radar Doppler Resolution
+        doppler_hz = doppler_shift_bins * (1.0 / (N * Tblock))
+        
         wavelength = c / fc
-        velocity_ms = (doppler_hz * wavelength) / 2
+        velocity_ms = (doppler_hz * wavelength) / 2.0
         
         return {
             "range_bin": r_bin,
@@ -244,153 +226,56 @@ class KalmanTracker:
         return self.x
     
 class SimpleTracker:
-    """
-    Lightweight single-target tracker for passive radar CAF frames.
-    Combines CFAR detection with Kalman filtering.
-    """
+    """Lean single-target tracker for passive radar CAF frames."""
     
     def __init__(self, fs: float, N: int, fc: float, Tblock: float, 
-                 pfa: float = 1e-5, guard_cells: int = 2, ref_cells: int = 8, enable_mse: bool = False):
-        """
-        Args:
-            fs: Sample rate (Hz)
-            N: Doppler FFT size (number of bins)
-            fc: Carrier frequency (Hz)
-            Tblock: Time between frames (seconds)
-            pfa: Probability of false alarm for CFAR
-            guard_cells: CFAR guard cells
-            ref_cells: CFAR reference cells
-            enable_mse: When False, skip all MSE computation/storage.
-        """
+                 pfa: float = 1e-5, guard_cells: int = 2, ref_cells: int = 8):
         self.fs = fs
         self.N = N
         self.fc = fc
         self.Tblock = Tblock
         
-        # CFAR detector
         self.detector = CFARDetectorVectorized(
-            guard_cells=guard_cells, 
-            ref_cells=ref_cells, 
-            pfa=pfa
+            guard_cells=guard_cells, ref_cells=ref_cells, pfa=pfa
         )
-        
-        # Single target tracker (initialize on first detection)
         self.tracker: KalmanTracker | None = None
-        self.track_history: List[Dict[str, float]] = []
         
-        self.mse_history: List[float] = []
-        self.enable_mse = enable_mse
+    def process_caf_frame(self, caf_power: np.ndarray, frame_idx: int, doppler_0_idx: int) -> dict:
+        detections, _ = self.detector.detect(caf_power)
         
-    def process_caf_frame(self, caf_mag_db: np.ndarray, frame_idx: int, 
-                         delay_0_idx: float = 0, doppler_0_idx: float | None = None) -> Dict:
-        """
-        Process one CAF frame with detection and tracking.
+        result = {'frame': frame_idx, 'active': False, 'r_bin': None, 'd_bin': None}
         
-        Args:
-            caf_mag_db: 2D array (range x doppler) in dB magnitude
-            frame_idx: Current frame number
-            delay_0_idx: Row index for zero delay
-            doppler_0_idx: Column index for zero Doppler (defaults to N/2)
-            
-        Returns:
-            dict with keys:
-                - 'frame': frame index
-                - 'num_detections': number of CFAR detections
-                - 'detections': Nx2 array of [row, col] bin indices
-                - 'det_mask': boolean detection mask
-                - 'track_state': dict with SI units (None if no track)
-                - 'mse': mean-squared error of prediction (None if disabled/no update)
-        """
-        if doppler_0_idx is None:
-            doppler_0_idx = self.N / 2
-        
-        # Convert dB magnitude to power for CFAR
-        caf_power = 10 ** (caf_mag_db / 10)
-        
-        # Run CFAR detection
-        detections, det_mask = self.detector.detect(caf_power)
-        
-        result = {
-            'frame': frame_idx,
-            'num_detections': len(detections),
-            'detections': detections,
-            'det_mask': det_mask,
-            'track_state': None,
-            'mse': None
-        }
-        
-        # Initialize tracker on first strong detection
         if self.tracker is None and len(detections) > 0:
-            # Pick strongest detection as initial target
             det_powers = [caf_power[int(d[0]), int(d[1])] for d in detections]
             strongest_idx = np.argmax(det_powers)
             r_bin, d_bin = detections[strongest_idx]
             
             self.tracker = KalmanTracker(dt=self.Tblock)
-            # Initialize state: [range_bin, range_rate, doppler_bin, doppler_rate]
             self.tracker.x = np.array([r_bin, 0.0, d_bin, 0.0])
+            print(f"  → Tracker locked at frame {frame_idx}")
             
-            print(f"  → Tracker initialized at frame {frame_idx}: "
-                  f"R={r_bin:.1f} bins, D={d_bin:.1f} bins")
-        
-        # Track existing target
         if self.tracker is not None:
-            # Predict next state
             predicted = self.tracker.predict()
             
-            # Find closest detection to prediction (data association)
             if len(detections) > 0:
-                pred_pos = np.array([predicted[0], predicted[2]])  # [range_bin, doppler_bin]
+                pred_pos = np.array([predicted[0], predicted[2]])
                 distances = [np.linalg.norm(d - pred_pos) for d in detections]
                 closest_idx = np.argmin(distances)
                 
-                # Update if close enough (gating threshold)
-                if distances[closest_idx] < 15:  # bins
-                    measurement = detections[closest_idx]
-                    self.tracker.update(measurement)
+                if distances[closest_idx] < 15:  
+                    self.tracker.update(detections[closest_idx])
                     
-                    if self.enable_mse:
-                        innovation = measurement - pred_pos
-                        mse = float(np.mean(innovation ** 2))
-                        self.mse_history.append(mse)
-                        result['mse'] = mse
-            
-            # Get current state in SI units
-            state_si = self.tracker.get_physics_state(
-                self.fs, self.N, self.fc, delay_0_idx, doppler_0_idx
+            result['active'] = True
+            result['state'] = self.tracker.get_physics_state(
+                fs=self.fs, 
+                N=self.N, 
+                fc=self.fc, 
+                Tblock=self.Tblock, # <--- Pass Tblock down
+                delay_0_idx=0, 
+                doppler_0_idx=doppler_0_idx # <--- Pass the dynamic zero index
             )
-            self.track_history.append(state_si)
-            result['track_state'] = state_si
-        
+            
         return result
-    
-    def get_track_summary(self) -> Dict[str, np.ndarray]:
-        """
-        Get arrays of tracked quantities over time.
-        
-        Returns:
-            dict with 'ranges_m', 'velocities_ms', 'mse', 'frames', 'mse_available'
-        """
-        if not self.track_history:
-            return {
-                'ranges_m': np.array([]),
-                'velocities_ms': np.array([]),
-                'range_bins': np.array([]),
-                'doppler_bins': np.array([]),
-                'mse': np.array(self.mse_history if self.enable_mse else []),
-                'mse_available': self.enable_mse,
-                'frames': np.array([])
-            }
-        
-        return {
-            'ranges_m': np.array([s['bistatic_range_m'] for s in self.track_history]),
-            'velocities_ms': np.array([s['bistatic_velocity_ms'] for s in self.track_history]),
-            'range_bins': np.array([s['range_bin'] for s in self.track_history]),
-            'doppler_bins': np.array([s['doppler_bin'] for s in self.track_history]),
-            'mse': np.array(self.mse_history if self.enable_mse else []),
-            'mse_available': self.enable_mse,
-            'frames': np.arange(len(self.track_history))
-        }
 
 
 class MultiTargetTracker: # do not use yet as an import, still in development
