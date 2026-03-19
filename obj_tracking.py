@@ -171,36 +171,40 @@ class KalmanTracker:
         fs: float,
         N: int,
         fc: float,
-        Tblock: float,  # <--- ADDED TBLOCK
+        Tblock: float, 
         delay_0_idx: float = 0,
         doppler_0_idx: float | None = None,
     ) -> Dict[str, float]:
         c = 299_792_458.0
         
         r_bin = self.x[0]
+        r_dot_bin = self.x[1]  # <--- Range Rate (bins per Tblock)
         d_bin = self.x[2]
+        d_dot_bin = self.x[3]  # <--- Doppler Rate (bins per Tblock)
         
-        # Bistatic Range (/ 2.0 added)
+        # Position Math
         delay_samples = r_bin - delay_0_idx
         range_m = ((delay_samples / fs) * c) / 2.0 
         
         if doppler_0_idx is None:
             doppler_0_idx = N / 2
-            
-        doppler_shift_bins = d_bin - doppler_0_idx
+        doppler_hz = (d_bin - doppler_0_idx) * (1.0 / (N * Tblock))
         
-        # CORRECT Passive Radar Doppler Resolution
-        doppler_hz = doppler_shift_bins * (1.0 / (N * Tblock))
+        # Velocity Math (Time-Derivatives)
+        # Convert bins/Tblock to SI/second
+        range_rate_m_s = ((r_dot_bin / fs * c) / 2.0) / Tblock
+        doppler_rate_hz_s = (d_dot_bin * (1.0 / (N * Tblock))) / Tblock
         
-        wavelength = c / fc
-        velocity_ms = (doppler_hz * wavelength) / 2.0
+        bistatic_velocity_ms = (doppler_hz * (c / fc)) / 2.0
         
         return {
             "range_bin": r_bin,
             "doppler_bin": d_bin,
             "bistatic_range_m": range_m,
             "doppler_hz": doppler_hz,
-            "bistatic_velocity_ms": velocity_ms
+            "bistatic_velocity_ms": bistatic_velocity_ms,
+            "range_rate_m_s": range_rate_m_s,       
+            "doppler_rate_hz_s": doppler_rate_hz_s  
         }
 
     def update(self, measurement: Iterable[float]) -> np.ndarray:
@@ -275,113 +279,77 @@ class SimpleTracker:
                 doppler_0_idx=doppler_0_idx # <--- Pass the dynamic zero index
             )
             
+        # Add the raw detections to the output!
+        result['raw_detections'] = detections 
         return result
 
 
-class MultiTargetTracker: # do not use yet as an import, still in development
+class MultiTargetTracker:
     """
-    Multi-target tracker with track initialization, association, and termination.
-    For more complex scenarios with multiple aircraft.
+    Lean Multi-Target Tracker for urban passive radar scenarios.
+    Handles Data Association, Coasting, and Track Lifecycles without hoarding history.
     """
     
     def __init__(self, fs: float, N: int, fc: float, Tblock: float,
-                 pfa: float = 1e-5, max_coast: int = 5,
-                 association_threshold: float = 20.0, enable_mse: bool = False):
-        """
-        Args:
-            fs: Sample rate (Hz)
-            N: Doppler FFT size
-            fc: Carrier frequency (Hz)
-            Tblock: Time between frames (seconds)
-            pfa: CFAR probability of false alarm
-            max_coast: Max frames to coast without detection before dropping track
-            association_threshold: Max distance (bins) for measurement association
-            enable_mse: When False, skip all MSE computation/storage.
-        """
+                 pfa: float = 1e-6, max_coast: int = 5,
+                 association_threshold: float = 20.0):
         self.fs = fs
         self.N = N
         self.fc = fc
         self.Tblock = Tblock
         
+        # Detector
         self.detector = CFARDetectorVectorized(guard_cells=2, ref_cells=10, pfa=pfa)
         
-        # Track management
+        # Track Management
         self.tracks: List[KalmanTracker] = []
         self.track_ids: List[int] = []
         self.coast_counters: List[int] = []
+        
         self.max_coast = max_coast
         self.association_threshold = association_threshold
-        self.enable_mse = enable_mse
         self.next_track_id = 0
         
-        # History
-        self.track_history: Dict[int, List[Dict[str, float]]] = {}
-        self.mse_history: Dict[int, List[float]] = {}
-        
-    def process_caf_frame(self, caf_mag_db: np.ndarray, frame_idx: int,
+    def process_caf_frame(self, caf_power: np.ndarray, frame_idx: int,
                          delay_0_idx: float = 0, doppler_0_idx: float | None = None) -> Dict:
-        """
-        Process one frame with multi-target tracking.
-        
-        Returns:
-            dict with 'detections', 'tracks', 'new_tracks', 'dropped_tracks'
-        """
         if doppler_0_idx is None:
             doppler_0_idx = self.N / 2
+            
+        detections, _ = self.detector.detect(caf_power)
         
-        caf_power = 10 ** (caf_mag_db / 10)
-        detections, det_mask = self.detector.detect(caf_power)
-        
-        # Predict all tracks
+        # 1. Predict all existing tracks
         for tracker in self.tracks:
             tracker.predict()
         
-        # Data association (nearest neighbor)
+        # 2. Data Association (Nearest Neighbor)
         associated = self._associate_detections(detections)
         
-        new_tracks = []
         dropped_tracks = []
-        frame_mse_by_track: Dict[int, float] = {}
         
-        # Update tracks
+        # 3. Update & Coast
         for i in range(len(self.tracks)):
             if associated[i] is not None:
-                pred_pos = np.array([self.tracks[i].x[0], self.tracks[i].x[2]], dtype=np.float64)
                 self.tracks[i].update(associated[i])
-                self.coast_counters[i] = 0
-
-                if self.enable_mse:
-                    innovation = associated[i] - pred_pos
-                    mse = float(np.mean(innovation ** 2))
-                    track_id = self.track_ids[i]
-                    frame_mse_by_track[track_id] = mse
-                    if track_id not in self.mse_history:
-                        self.mse_history[track_id] = []
-                    self.mse_history[track_id].append(mse)
-                
-                # Store history
-                state_si = self.tracks[i].get_physics_state(
-                    self.fs, self.N, self.fc, delay_0_idx, doppler_0_idx
-                )
-                track_id = self.track_ids[i]
-                if track_id not in self.track_history:
-                    self.track_history[track_id] = []
-                self.track_history[track_id].append(state_si)
+                self.coast_counters[i] = 0  # Reset coasting if hit
             else:
-                self.coast_counters[i] += 1
+                self.coast_counters[i] += 1 # Coast if missed
                 
+                # Tag for dropping if coasting too long
                 if self.coast_counters[i] > self.max_coast:
                     dropped_tracks.append(self.track_ids[i])
         
-        # Remove dropped tracks
+        # 4. Remove Dropped Tracks
         for track_id in dropped_tracks:
             idx = self.track_ids.index(track_id)
             del self.tracks[idx]
             del self.track_ids[idx]
             del self.coast_counters[idx]
+            print(f"  [-] Dropped track {track_id}")
         
-        # Initialize new tracks from unassociated detections
+        # 5. Spawn New Tracks for Unassociated Detections
+        # Find which detections were claimed by existing tracks
         used_det_indices = {i for i, assoc in enumerate(associated) if assoc is not None}
+        
         for det_idx, det in enumerate(detections):
             if det_idx not in used_det_indices:
                 new_tracker = KalmanTracker(dt=self.Tblock)
@@ -390,69 +358,27 @@ class MultiTargetTracker: # do not use yet as an import, still in development
                 self.tracks.append(new_tracker)
                 self.track_ids.append(self.next_track_id)
                 self.coast_counters.append(0)
-                new_tracks.append(self.next_track_id)
-                self.track_history[self.next_track_id] = []
-                if self.enable_mse:
-                    self.mse_history[self.next_track_id] = []
                 
+                print(f"  [+] Spawned track {self.next_track_id} at Frame {frame_idx}")
                 self.next_track_id += 1
         
-        # Current track states
+        # 6. Extract Physics States for Plotting
         current_tracks = []
         for tracker, track_id in zip(self.tracks, self.track_ids):
             state_si = tracker.get_physics_state(
-                self.fs, self.N, self.fc, delay_0_idx, doppler_0_idx
+                fs=self.fs, N=self.N, fc=self.fc, Tblock=self.Tblock, 
+                delay_0_idx=delay_0_idx, doppler_0_idx=doppler_0_idx
             )
             current_tracks.append({'track_id': track_id, **state_si})
         
         return {
             'frame': frame_idx,
-            'detections': detections,
             'tracks': current_tracks,
-            'new_tracks': new_tracks,
-            'dropped_tracks': dropped_tracks,
-            'det_mask': det_mask,
-            'mse_by_track': frame_mse_by_track if self.enable_mse else None,
-            'mse_available': self.enable_mse,
-        }
-
-    def get_track_summary(self, track_id: int | None = None) -> Dict:
-        """
-        Get summary arrays for one track or all tracks.
-
-        Args:
-            track_id: specific track to summarize, or None for all tracks.
-        """
-        if track_id is not None:
-            hist = self.track_history.get(track_id, [])
-            return {
-                'track_id': track_id,
-                'ranges_m': np.array([s['bistatic_range_m'] for s in hist]),
-                'velocities_ms': np.array([s['bistatic_velocity_ms'] for s in hist]),
-                'range_bins': np.array([s['range_bin'] for s in hist]),
-                'doppler_bins': np.array([s['doppler_bin'] for s in hist]),
-                'mse': np.array(self.mse_history.get(track_id, []) if self.enable_mse else []),
-                'mse_available': self.enable_mse,
-                'frames': np.arange(len(hist)),
-            }
-
-        return {
-            'tracks': {
-                tid: {
-                    'ranges_m': np.array([s['bistatic_range_m'] for s in self.track_history.get(tid, [])]),
-                    'velocities_ms': np.array([s['bistatic_velocity_ms'] for s in self.track_history.get(tid, [])]),
-                    'range_bins': np.array([s['range_bin'] for s in self.track_history.get(tid, [])]),
-                    'doppler_bins': np.array([s['doppler_bin'] for s in self.track_history.get(tid, [])]),
-                    'mse': np.array(self.mse_history.get(tid, []) if self.enable_mse else []),
-                    'frames': np.arange(len(self.track_history.get(tid, []))),
-                }
-                for tid in self.track_history.keys()
-            },
-            'mse_available': self.enable_mse,
+            'raw_detections': detections # Returned so your CFAR shotgun plot still works!
         }
     
     def _associate_detections(self, detections: np.ndarray) -> List[np.ndarray | None]:
-        """Nearest neighbor data association."""
+        """Nearest neighbor data association logic."""
         associated = [None] * len(self.tracks)
         used_detections = set()
         

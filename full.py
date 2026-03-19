@@ -392,7 +392,7 @@ def save_correlation_mp4(x_axis_m, before_frames, after_frames, out_path, fps):
     plt.close(fig)
 
 
-def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None):
+def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None, show_cfar=True):
     """
     Builds Range–Doppler CAF frames from caf_corr (list of complex correlation vectors)
     and saves an MP4 without storing all frames in memory.
@@ -438,8 +438,12 @@ def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None)
     ax.set_ylabel("Doppler (Hz)")
     ax.set_title("Range–Doppler CAF (After NLMS)")
 
-    # a marker to represent our Kalman Filter estimate
-    tracker_point, = ax.plot([], [], 'ro', markersize=12, markeredgewidth=3, label='Kalman Track')
+    # Kalman Filter Outputs
+    cfar_scatter, = ax.plot([], [], 'kx', markersize=4, alpha=0.8, label='Raw CFAR') #CFAR layer
+    tracker_point, = ax.plot([], [], 'ro', markersize=6, markeredgewidth=3, label='Kalman Track')
+    
+    tracker_vector, = ax.plot([], [], 'r-', linewidth=2, label='Rate Vector') # optional: rate "line" vector
+    #tracker_vector = ax.quiver([0.0], [0.0], [0.0], [0.0], color='r', scale=1, scale_units='xy', angles='xy', width=0.005, zorder=5, label='Rate Vector') # optional: rate vector using quiver NOTE: Quiver is not functional
     ax.legend(loc="upper right")
 
     writer = FFMpegWriter(fps=fps)
@@ -468,15 +472,63 @@ def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None)
                 
                 track_res = tracker.process_caf_frame(caf_power, i, doppler_0_idx=d_zero_idx)
                 
+                # --- PLOT CFAR "SHOTGUN" ---
+                if show_cfar and len(track_res.get('raw_detections', [])) > 0:
+                    raw_dets = track_res['raw_detections']
+                    c = 299_792_458.0
+                    fs = tracker.fs
+                    
+                    # Vectorized conversion of bin arrays to SI units
+                    r_m_arr = (raw_dets[:, 0] / fs * c) / 2.0
+                    d_hz_arr = (raw_dets[:, 1] - d_zero_idx) * (1.0 / (Nslow * Tblock))
+                    cfar_scatter.set_data(r_m_arr, d_hz_arr)
+                else:
+                    cfar_scatter.set_data([], [])
+
+                # --- PLOT KALMAN VECTOR ---
                 if track_res['active']:
-                    # Pluck the SI units directly from the physics state
-                    r_meters = track_res['state']['bistatic_range_m']
+                    r_m = track_res['state']['bistatic_range_m']
                     d_hz = track_res['state']['doppler_hz']
                     
-                    # Plot the hollow red dot
-                    tracker_point.set_data([r_meters], [d_hz])
+                    rdot = track_res['state']['range_rate_m_s']
+                    ddot = track_res['state']['doppler_rate_hz_s']
+                    
+                    # viewport sizes
+                    span_r = x_axis_m[-1] - x_axis_m[0]
+                    span_d = doppler_zoom[-1] - doppler_zoom[0]
+                    
+                    # calculate "screen fraction" (how much screen covered per integration step)
+                    frac_rdot = rdot / span_r
+                    frac_ddot = ddot / span_d
+                    
+                    # magnitude accounting for aspect ratio distortion
+                    screen_magnitude = np.hypot(frac_rdot, frac_ddot)
+                    
+                    # normalize vector then scale to 10% of the screen
+                    threshold_m = 1e-6 # avoid division by zero for very slow targets
+                    scale_m = 0.1
+                    if screen_magnitude > threshold_m:
+                        t_scale = scale_m / screen_magnitude
+                    else:
+                        t_scale = 0.0
+                        
+                    # project velocity vector to end point in range-Doppler space
+                    r_proj = rdot * t_scale
+                    d_proj = ddot * t_scale
+                    end_r = r_m + (r_proj)
+                    end_d = d_hz + (d_proj)
+                    
+                    tracker_point.set_data([r_m], [d_hz])
+                    tracker_vector.set_data([r_m, end_r], [d_hz, end_d]) #for simple line vector
+
+                    #tracker_vector.set_offsets(np.array([[r_m, d_hz]])) # for quiver base position
+                    #tracker_vector.set_UVC(np.array([r_proj]), np.array([d_proj])) # for quiver base position
                 else:
-                    tracker_point.set_data([], []) # Hide marker if lost
+                    tracker_point.set_data([], [])
+                    tracker_vector.set_data([], []) #for simple line vector
+                    #tracker_vector.set_offsets(np.empty((0, 2))) # for quiver base position 
+                    #tracker_vector.set_UVC(np.empty(0), np.empty(0)) # for quiver base position
+                    
             writer.grab_frame()
 
     plt.close(fig)
@@ -626,7 +678,7 @@ def main():
     
     # Instantiate a tracker and pass it to the CAF MP4 generator
     target_tracker = SimpleTracker(fs=Fs, N=Nslow, fc=509e6, Tblock=Tblock)
-    save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps, tracker=target_tracker)
+    save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps, tracker=target_tracker, show_cfar=True)
 
     print("Finished:")
     print(" ", corr_mp4)
