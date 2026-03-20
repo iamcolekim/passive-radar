@@ -286,70 +286,104 @@ class SimpleTracker:
 
 class MultiTargetTracker:
     """
-    Lean Multi-Target Tracker for urban passive radar scenarios.
-    Handles Data Association, Coasting, and Track Lifecycles without hoarding history.
+    Multi-Target Tracker with M-out-of-N Track Lifecycle Management.
+    Rejects transient urban clutter by requiring persistent detections.
     """
     
     def __init__(self, fs: float, N: int, fc: float, Tblock: float,
-                 pfa: float = 1e-6, max_coast: int = 5,
-                 association_threshold: float = 20.0):
+                 pfa: float = 1e-6, guard_cells: int = 2, ref_cells: int = 10, max_coast: int = 5,
+                 association_threshold: float = 20.0,
+                 confirm_hits: int = 3, confirm_window: int = 5):
         self.fs = fs
         self.N = N
         self.fc = fc
         self.Tblock = Tblock
         
         # Detector
-        self.detector = CFARDetectorVectorized(guard_cells=2, ref_cells=10, pfa=pfa)
+        self.detector = CFARDetectorVectorized(guard_cells=guard_cells, ref_cells=ref_cells, pfa=pfa)
         
-        # Track Management
+        # Track Management Arrays
         self.tracks: List[KalmanTracker] = []
         self.track_ids: List[int] = []
         self.coast_counters: List[int] = []
         
+        # --- Lifecycle Management ---
+        self.track_states: List[str] = []  # 'tentative' or 'confirmed'
+        self.hit_counters: List[int] = []  # M
+        self.age_counters: List[int] = []  # N
+        
         self.max_coast = max_coast
         self.association_threshold = association_threshold
+        self.confirm_hits = confirm_hits # M
+        self.confirm_window = confirm_window # N
         self.next_track_id = 0
         
     def process_caf_frame(self, caf_power: np.ndarray, frame_idx: int,
                          delay_0_idx: float = 0, doppler_0_idx: float | None = None) -> Dict:
         if doppler_0_idx is None:
             doppler_0_idx = self.N / 2
-            
+
+        # Zero out +/- 1 Hz around the center to kill static clutter artifacts
+        notch_width_bins = 2  # Tune this based on your bin resolution
+        center_d = int(doppler_0_idx)
+        caf_power[:, center_d - notch_width_bins : center_d + notch_width_bins + 1] = 0.0
+
+        detections, _ = self.detector.detect(caf_power) 
         detections, _ = self.detector.detect(caf_power)
         
         # 1. Predict all existing tracks
         for tracker in self.tracks:
             tracker.predict()
         
-        # 2. Data Association (Nearest Neighbor)
+        # 2. Data Association
         associated = self._associate_detections(detections)
-        
         dropped_tracks = []
         
-        # 3. Update & Coast
+        # 3. Update, Coast, and Lifecycle Logic
         for i in range(len(self.tracks)):
+            self.age_counters[i] += 1
+            
             if associated[i] is not None:
+                # HIT: Update Kalman and counters
                 self.tracks[i].update(associated[i])
-                self.coast_counters[i] = 0  # Reset coasting if hit
-            else:
-                self.coast_counters[i] += 1 # Coast if missed
+                self.coast_counters[i] = 0
+                self.hit_counters[i] += 1
                 
-                # Tag for dropping if coasting too long
+                # Check for Promotion to Confirmed
+                if self.track_states[i] == 'tentative' and self.hit_counters[i] >= self.confirm_hits:
+                    self.track_states[i] = 'confirmed'
+                    print(f"  [^] PROMOTED track {self.track_ids[i]} to Confirmed at Frame {frame_idx}")
+            else:
+                # MISS: Coasting
+                self.coast_counters[i] += 1
+                
+            # --- Lifecycle Death Conditions ---
+            if self.track_states[i] == 'tentative':
+                # Failed the M-out-of-N test? (e.g., reached 5 frames but didn't get 3 hits)
+                # Or mathematically impossible to reach M hits in remaining N window
+                remaining_frames = self.confirm_window - self.age_counters[i]
+                needed_hits = self.confirm_hits - self.hit_counters[i]
+                
+                if self.age_counters[i] >= self.confirm_window or remaining_frames < needed_hits:
+                    dropped_tracks.append(self.track_ids[i])
+            else:
+                # Standard dropping for confirmed tracks
                 if self.coast_counters[i] > self.max_coast:
                     dropped_tracks.append(self.track_ids[i])
         
-        # 4. Remove Dropped Tracks
+        # 4. Remove Dropped Tracks (Backwards loop to safely delete by index)
         for track_id in dropped_tracks:
             idx = self.track_ids.index(track_id)
             del self.tracks[idx]
             del self.track_ids[idx]
             del self.coast_counters[idx]
-            print(f"  [-] Dropped track {track_id}")
+            del self.track_states[idx]
+            del self.hit_counters[idx]
+            del self.age_counters[idx]
+            # Optional: print(f"  [-] Dropped track {track_id}")
         
-        # 5. Spawn New Tracks for Unassociated Detections
-        # Find which detections were claimed by existing tracks
+        # 5. Spawn New "Tentative" Tracks
         used_det_indices = {i for i, assoc in enumerate(associated) if assoc is not None}
-        
         for det_idx, det in enumerate(detections):
             if det_idx not in used_det_indices:
                 new_tracker = KalmanTracker(dt=self.Tblock)
@@ -359,39 +393,41 @@ class MultiTargetTracker:
                 self.track_ids.append(self.next_track_id)
                 self.coast_counters.append(0)
                 
-                print(f"  [+] Spawned track {self.next_track_id} at Frame {frame_idx}")
+                self.track_states.append('tentative')
+                self.hit_counters.append(1)
+                self.age_counters.append(1)
+                
                 self.next_track_id += 1
         
-        # 6. Extract Physics States for Plotting
+        # 6. Extract Physics States ONLY for Confirmed Tracks
         current_tracks = []
-        for tracker, track_id in zip(self.tracks, self.track_ids):
-            state_si = tracker.get_physics_state(
-                fs=self.fs, N=self.N, fc=self.fc, Tblock=self.Tblock, 
-                delay_0_idx=delay_0_idx, doppler_0_idx=doppler_0_idx
-            )
-            current_tracks.append({'track_id': track_id, **state_si})
+        for i in range(len(self.tracks)):
+            if self.track_states[i] == 'confirmed':
+                state_si = self.tracks[i].get_physics_state(
+                    fs=self.fs, N=self.N, fc=self.fc, Tblock=self.Tblock, 
+                    delay_0_idx=delay_0_idx, doppler_0_idx=doppler_0_idx
+                )
+                current_tracks.append({'track_id': self.track_ids[i], **state_si})
         
         return {
             'frame': frame_idx,
             'tracks': current_tracks,
-            'raw_detections': detections # Returned so your CFAR shotgun plot still works!
+            'raw_detections': detections
         }
     
     def _associate_detections(self, detections: np.ndarray) -> List[np.ndarray | None]:
-        """Nearest neighbor data association logic."""
+        # [Keep your existing nearest neighbor logic exactly the same]
         associated = [None] * len(self.tracks)
         used_detections = set()
         
         for i, tracker in enumerate(self.tracks):
             predicted_pos = np.array([tracker.x[0], tracker.x[2]])
-            
             best_dist = float('inf')
             best_det_idx = None
             
             for j, det in enumerate(detections):
                 if j in used_detections:
                     continue
-                
                 dist = np.linalg.norm(det - predicted_pos)
                 if dist < best_dist and dist < self.association_threshold:
                     best_dist = dist

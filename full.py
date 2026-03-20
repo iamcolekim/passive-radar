@@ -18,7 +18,7 @@ from numba import njit
 from tqdm import tqdm
 
 # User Imports
-from obj_tracking import SimpleTracker
+from obj_tracking import SimpleTracker, MultiTargetTracker
 
 
 def read_cs8_block(f, n_complex: int):
@@ -438,12 +438,23 @@ def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None,
     ax.set_ylabel("Doppler (Hz)")
     ax.set_title("Range–Doppler CAF (After NLMS)")
 
-    # Kalman Filter Outputs
-    cfar_scatter, = ax.plot([], [], 'kx', markersize=4, alpha=0.8, label='Raw CFAR') #CFAR layer
+    # Kalman Filter Outputs and Options
+    cfar_scatter, = ax.plot([], [], 'kx', markersize=4, alpha=0.8, zorder=4, label='Raw CFAR') #CFAR layer
+    
+    track_lines = {}  # Will hold {'point': Line2D, 'vector': Line2D} for each active track ID
+    # High-contrast colors designed to pop against the dark purple/green heatmap
+    palette = ['#FF0000', '#00FF00', '#00FFFF', '#FF00FF', '#FFA500', '#FFFF00', '#1E90FF']
+
+    '''
+    # old simple single-tracker implementation. for multiple tracks, we use the dict above.
     tracker_point, = ax.plot([], [], 'ro', markersize=6, markeredgewidth=3, label='Kalman Track')
     
     tracker_vector, = ax.plot([], [], 'r-', linewidth=2, label='Rate Vector') # optional: rate "line" vector
     #tracker_vector = ax.quiver([0.0], [0.0], [0.0], [0.0], color='r', scale=1, scale_units='xy', angles='xy', width=0.005, zorder=5, label='Rate Vector') # optional: rate vector using quiver NOTE: Quiver is not functional
+    ax.legend(loc="upper right")
+    '''
+    
+    ax.plot([], [], 'ro', markerfacecolor='none', label='Kalman Tracks')
     ax.legend(loc="upper right")
 
     writer = FFMpegWriter(fps=fps)
@@ -466,83 +477,91 @@ def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None,
             # run tracker logic
             if tracker is not None:
                 caf_power = np.abs(RD.T)**2 
-                
-                # Find the exact index of 0 Hz in the cropped array
                 d_zero_idx = int(np.argmin(np.abs(doppler_zoom)))
                 
                 track_res = tracker.process_caf_frame(caf_power, i, doppler_0_idx=d_zero_idx)
                 
-                # --- PLOT CFAR "SHOTGUN" ---
+                # --- BACKWARDS COMPATIBILITY ADAPTER ---
+                active_tracks = []
+                if 'tracks' in track_res:
+                    # MultiTargetTracker output
+                    active_tracks = track_res['tracks']
+                elif track_res.get('active', False):
+                    # SimpleTracker output (wrap it to look like a MultiTarget track)
+                    active_tracks = [{'track_id': 0, **track_res['state']}]
+
+                # --- PLOT CFAR SHOTGUN ---
                 if show_cfar and len(track_res.get('raw_detections', [])) > 0:
                     raw_dets = track_res['raw_detections']
                     c = 299_792_458.0
                     fs = tracker.fs
-                    
-                    # Vectorized conversion of bin arrays to SI units
                     r_m_arr = (raw_dets[:, 0] / fs * c) / 2.0
                     d_hz_arr = (raw_dets[:, 1] - d_zero_idx) * (1.0 / (Nslow * Tblock))
                     cfar_scatter.set_data(r_m_arr, d_hz_arr)
                 else:
                     cfar_scatter.set_data([], [])
 
-                # --- PLOT KALMAN VECTOR ---
-                if track_res['active']:
-                    r_m = track_res['state']['bistatic_range_m']
-                    d_hz = track_res['state']['doppler_hz']
+                # --- PLOT COLOR-CODED TRACKS ---
+                current_ids = set()
+                span_r = x_axis_m[-1] - x_axis_m[0]
+                span_d = doppler_zoom[-1] - doppler_zoom[0]
+                
+                for t in active_tracks:
+                    tid = t['track_id']
+                    current_ids.add(tid)
                     
-                    rdot = track_res['state']['range_rate_m_s']
-                    ddot = track_res['state']['doppler_rate_hz_s']
+                    # If this is a newly spawned track, create line objects for it
+                    if tid not in track_lines:
+                        color = palette[tid % len(palette)]
+                        p_line, = ax.plot([], [], marker='o', color=color, markersize=8, 
+                                          markeredgewidth=2, markerfacecolor='none', linestyle='None', zorder=5)
+                        v_line, = ax.plot([], [], '-', color=color, linewidth=2, zorder=5)
+                        track_lines[tid] = {'point': p_line, 'vector': v_line}
                     
-                    # viewport sizes
-                    span_r = x_axis_m[-1] - x_axis_m[0]
-                    span_d = doppler_zoom[-1] - doppler_zoom[0]
+                    # Get physics state
+                    r_m = t['bistatic_range_m']
+                    d_hz = t['doppler_hz']
+                    rdot = t['range_rate_m_s']
+                    ddot = t['doppler_rate_hz_s']
                     
-                    # calculate "screen fraction" (how much screen covered per integration step)
+                    # Aspect Ratio Scale Math
                     frac_rdot = rdot / span_r
                     frac_ddot = ddot / span_d
-                    
-                    # magnitude accounting for aspect ratio distortion
-                    screen_magnitude = np.hypot(frac_rdot, frac_ddot)
-                    
-                    # normalize vector then scale to 10% of the screen
-                    threshold_m = 1e-6 # avoid division by zero for very slow targets
-                    scale_m = 0.1
-                    if screen_magnitude > threshold_m:
-                        t_scale = scale_m / screen_magnitude
-                    else:
-                        t_scale = 0.0
+                    screen_mag = np.hypot(frac_rdot, frac_ddot)
+                    scale_mag = 0.1
+                    threshold_mag = 1e-6 # avoid division by zero and excessively long vectors for very slow targets
+                    t_scale = scale_mag / screen_mag if screen_mag > threshold_mag else 0.0
                         
-                    # project velocity vector to end point in range-Doppler space
-                    r_proj = rdot * t_scale
-                    d_proj = ddot * t_scale
-                    end_r = r_m + (r_proj)
-                    end_d = d_hz + (d_proj)
+                    end_r = r_m + (rdot * t_scale)
+                    end_d = d_hz + (ddot * t_scale)
                     
-                    tracker_point.set_data([r_m], [d_hz])
-                    tracker_vector.set_data([r_m, end_r], [d_hz, end_d]) #for simple line vector
-
-                    #tracker_vector.set_offsets(np.array([[r_m, d_hz]])) # for quiver base position
-                    #tracker_vector.set_UVC(np.array([r_proj]), np.array([d_proj])) # for quiver base position
-                else:
-                    tracker_point.set_data([], [])
-                    tracker_vector.set_data([], []) #for simple line vector
-                    #tracker_vector.set_offsets(np.empty((0, 2))) # for quiver base position 
-                    #tracker_vector.set_UVC(np.empty(0), np.empty(0)) # for quiver base position
+                    # Update this specific track's lines
+                    track_lines[tid]['point'].set_data([r_m], [d_hz])
+                    track_lines[tid]['vector'].set_data([r_m, end_r], [d_hz, end_d])
+                
+                # --- MEMORY MANAGEMENT: DELETE DEAD TRACKS ---
+                for tid in list(track_lines.keys()):
+                    if tid not in current_ids:
+                        # Remove the line objects from the matplotlib axes entirely
+                        track_lines[tid]['point'].remove()
+                        track_lines[tid]['vector'].remove()
+                        # Delete from our tracking dictionary
+                        del track_lines[tid]
                     
             writer.grab_frame()
 
     plt.close(fig)
 
 def main():
-    fid_x_path = "/Users/colekim/Documents/Y4_Work/Capstone/DevWork/509.0MHz_20260217_184044/ref.cs8"
-    fid_y_path = "/Users/colekim/Documents/Y4_Work/Capstone/DevWork/509.0MHz_20260217_184044/surv.cs8"
+    fid_x_path = "/Users/colekim/Documents/Y4_Work/Capstone/all_recordings/12_54_51/9f_509.0MHz_15.0MSPS_20260314_125451.cs8"
+    fid_y_path = "/Users/colekim/Documents/Y4_Work/Capstone/all_recordings/12_54_51/63_509.0MHz_15.0MSPS_20260314_125451.cs8"
     if not os.path.exists(fid_x_path):
         raise FileNotFoundError("Input file not found")
 
-    length = 2 * 4096
-    Fs = 10e6
-
-    Nslow = 1000
+    cpi = 0.5 
+    length = 32*1024
+    Fs = 15e6
+    Nslow = int(cpi * Fs / length)
     L = 80
     mu = 0.1
     eps = 1e-6
@@ -677,7 +696,8 @@ def main():
         caf_corr.append(R_after_cplx[k][mask])
     
     # Instantiate a tracker and pass it to the CAF MP4 generator
-    target_tracker = SimpleTracker(fs=Fs, N=Nslow, fc=509e6, Tblock=Tblock)
+    #target_tracker = SimpleTracker(fs=Fs, N=Nslow, fc=509e6, Tblock=Tblock)
+    target_tracker = MultiTargetTracker(fs=Fs, N=Nslow, fc=509e6, Tblock=Tblock, pfa=1e-6, association_threshold=3)
     save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps, tracker=target_tracker, show_cfar=True)
 
     print("Finished:")
