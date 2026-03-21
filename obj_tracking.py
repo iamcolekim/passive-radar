@@ -439,8 +439,122 @@ class MultiTargetTracker:
         
         return associated
     
-# --- SIMULATION DEMO ---
-if __name__ == "__main__":
+# --- SIMULATION DEMOS ---
+
+def run_simple_tracker_demo():
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # 1. Setup Simulation & Radar Parameters
+    heatmap_dim = 200
+    noise_power = 10.0
+    signal_power = 150.0
+    num_steps = 50 
+    
+    # Radar Physics parameters (Needed for SimpleTracker)
+    fs = 2.048e6      # 2.048 MHz sample rate
+    N = 1024          # Doppler bins
+    fc = 100e6        # 100 MHz carrier (e.g., FM band)
+    Tblock = 0.5      # 0.5 seconds per frame
+    doppler_0_idx = heatmap_dim // 2  # Center of the heatmap
+    
+    print("--- Kalman Tracker End-to-End Simulation ---")
+    
+    # 2. Initialize the SimpleTracker
+    rng = np.random.default_rng(42)
+    tracker_system = SimpleTracker(
+        fs=fs, N=N, fc=fc, Tblock=Tblock, 
+        pfa=1e-4, guard_cells=2, ref_cells=15
+    )
+    
+    # TUNE: We can manually override the Kalman R matrix inside the SimpleTracker 
+    # once it initializes, but we'll let it use your default for now to see how it performs.
+
+    # Ground Truth Kinematics (in Bins)
+    true_r, true_d = 50.0, 50.0
+    vel_r, vel_d = 2.0, 0.5
+    
+    # Storage for plotting (Using RMSE in Bins)
+    metrics = {
+        'time': [],
+        'r_est_err': [], 'd_est_err': [],
+        'r_meas_err': [], 'd_meas_err': []
+    }
+
+    print(f"{'Step':<5} {'True R':<8} {'True D':<8} {'Meas R':<8} {'Meas D':<8} {'Est R':<8} {'Est D':<8}")
+    print("-" * 65)
+
+    for t in range(num_steps):
+        # 1. Move "Truth"
+        true_r += vel_r
+        true_d += vel_d
+        
+        # 2. Generate new CAF Heatmap Frame
+        heatmap = rng.exponential(scale=noise_power, size=(heatmap_dim, heatmap_dim))
+        
+        # Inject Target (Quantized to integer bins)
+        r_idx, d_idx = int(round(true_r)), int(round(true_d))
+        if 0 <= r_idx < heatmap_dim and 0 <= d_idx < heatmap_dim:
+            heatmap[r_idx-1:r_idx+2, d_idx-1:d_idx+2] += (signal_power * 0.3)
+            heatmap[r_idx, d_idx] += signal_power
+            
+        # 3. Process the frame through the SimpleTracker
+        result = tracker_system.process_caf_frame(heatmap, frame_idx=t, doppler_0_idx=doppler_0_idx)
+        
+        # 4. Extract metrics if the tracker is active
+        if result['active']:
+            state = result['state']
+            est_r = state['range_bin']
+            est_d = state['doppler_bin']
+            
+            # Find the closest raw detection to the truth to simulate the "Measurement Error"
+            raw_dets = result['raw_detections']
+            if len(raw_dets) > 0:
+                distances = [np.linalg.norm(d - np.array([true_r, true_d])) for d in raw_dets]
+                best_idx = np.argmin(distances)
+                meas_r, meas_d = raw_dets[best_idx]
+            else:
+                meas_r, meas_d = true_r, true_d # Fallback if CFAR missed completely
+            
+            # Record Metrics (Square Error)
+            metrics['time'].append(t)
+            metrics['r_est_err'].append((true_r - est_r)**2)
+            metrics['d_est_err'].append((true_d - est_d)**2)
+            metrics['r_meas_err'].append((true_r - meas_r)**2)
+            metrics['d_meas_err'].append((true_d - meas_d)**2)
+            
+            if t % 5 == 0:
+                print(f"{t:<5} {true_r:<8.1f} {true_d:<8.1f} {meas_r:<8.1f} {meas_d:<8.1f} {est_r:<8.1f} {est_d:<8.1f}")
+        else:
+            print(f"{t:<5} INITIALIZING / WAITING FOR LOCK")
+
+    # --- Plotting RMSE ---
+    rmse_r_est = np.sqrt(metrics['r_est_err'])
+    rmse_d_est = np.sqrt(metrics['d_est_err'])
+    rmse_r_meas = np.sqrt(metrics['r_meas_err'])
+    rmse_d_meas = np.sqrt(metrics['d_meas_err'])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    ax1.plot(metrics['time'], rmse_r_meas, label='Raw CFAR Measurement Error', marker='^', alpha=0.5)
+    ax1.plot(metrics['time'], rmse_r_est, label='Kalmamn Tracker Filtered Error', marker='o', linewidth=2)
+    ax1.set_ylabel('Range Error (Bins)')
+    ax1.set_title('Kalman Tracker Performance: Range Dimension')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(metrics['time'], rmse_d_meas, label='Raw CFAR Measurement Error', marker='^', color='green', alpha=0.5)
+    ax2.plot(metrics['time'], rmse_d_est, label='Kalman Tracker Filtered Error', marker='o', color='red', linewidth=2)
+    ax2.set_ylabel('Doppler Error (Bins)')
+    ax2.set_xlabel('Frame Step')
+    ax2.set_title('Kalman Tracker Performance: Doppler Dimension')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+def run_cfar_and_kalman_demo():
     # 1. Setup
     # Create a 200x200 dummy map with noise
     heatmap_dim = 200
@@ -476,7 +590,7 @@ if __name__ == "__main__":
     
     print("\n--- Tracking Simulation ---")
     print(f"Signal Power: {signal_power:.2f}, Noise Mean: {noise_mean:.2f}, SNR: {snr_db:.2f} dB\n")
-    print(f"{'Step':<5} {'True R':<10} {'True D':<10} {'Meas R':<10} {'Meas D':<10} {'Est R':<10} {'Est D':<10} {'MSE T-E':<12} {'MSE M-E':<12}")
+    print(f"{'Step':<5} {'True R':<10} {'True D':<10} {'Meas R':<10} {'Meas D':<10} {'Est R':<10} {'Est D':<10} {'MSE T-E':<12} {'MSE M-E':<12} {'MSE M-T':<12}")
     print("-" * 20)
     
     # Simulate the target moving for 10 steps
@@ -503,5 +617,84 @@ if __name__ == "__main__":
         
         # Calculate MSE: Measured vs Estimated
         mse_meas_est = ((meas_r - est[0])**2 + (meas_d - est[2])**2) / 2
+
+        # Calculate MSE: Measured vs True (for reference)
+        mse_meas_true = ((meas_r - true_r)**2 + (meas_d - true_d)**2) / 2
         
-        print(f"{t:<5} {true_r:<10.2f} {true_d:<10.2f} {meas_r:<10.2f} {meas_d:<10.2f} {est[0]:<10.2f} {est[2]:<10.2f} {mse_true_est:<12.4f} {mse_meas_est:<12.4f}")
+        print(f"{t:<5} {true_r:<10.2f} {true_d:<10.2f} {meas_r:<10.2f} {meas_d:<10.2f} {est[0]:<10.2f} {est[2]:<10.2f} {mse_true_est:<12.4f} {mse_meas_est:<12.4f} {mse_meas_true:<12.4f}")
+
+        # Store MSE values for plotting
+        if t == 0:
+            mse_true_est_list = []
+            mse_meas_est_list = []
+            mse_meas_true_list = []
+        mse_true_est_list.append(mse_true_est)
+        mse_meas_est_list.append(mse_meas_est)
+        mse_meas_true_list.append(mse_meas_true)
+
+        # store the raw values for plotting trajectories       
+        if t == 0:
+            true_r_list = []
+            true_d_list = []
+            meas_r_list = []
+            meas_d_list = []
+            est_r_list = []
+            est_d_list = []
+        true_r_list.append(true_r)
+        true_d_list.append(true_d)
+        meas_r_list.append(meas_r)
+        meas_d_list.append(meas_d)
+        est_r_list.append(est[0])
+        est_d_list.append(est[2])  
+
+        # store the raw residuals for plotting
+        if t == 0:
+            residual_true_est_r = []
+            residual_true_est_d = []
+            residual_meas_est_r = []
+            residual_meas_est_d = []
+        residual_true_est_r.append(true_r - est[0])
+        residual_true_est_d.append(true_d - est[2])
+        residual_meas_est_r.append(meas_r - est[0])
+        residual_meas_est_d.append(meas_d - est[2]) 
+
+   
+    plt.figure(figsize=(10, 6))
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    # Plot MSE errors
+    #plt.plot(mse_true_est_list, label='Kalman Estimate vs True', marker='o', linewidth=2)
+    #plt.plot(mse_meas_est_list, label='Kalman Estimate vs Measurement ', marker='s', linewidth=2)
+    #plt.plot(mse_meas_true_list, label='Measurement vs True', marker='^', linewidth=2)
+    #plt.plot([0, 9], [noise_power, noise_power], 'k--', label='Noise Power (Baseline)')
+    #plt.plot([0, 9], [signal_power, signal_power], 'r--', label='Signal Power (Ideal Target)')
+    #plt.plot([0, 9], [snr_linear, snr_linear], 'g--', label=f'SNR (semi-log) = {10 * np.log10(snr_linear):.2f}')
+    #plt.plot(mse_meas_est_list - np.array(mse_meas_true_list), label='Estimate Error Variance (Jitter)', marker='x', linestyle='--', color='magenta')
+    #plt.ylabel('Mean Squared Error')
+    #plt.title('Tracking Error Comparison')
+    
+    # Plot the trajectories (True vs Measured vs Estimated) for visual confirmation
+    plt.plot(true_r_list, true_d_list, label='True Target Trajectory', marker='o', linewidth=2)
+    plt.plot(meas_r_list, meas_d_list, label='Simulated Measurements (with injected noise)', marker='s', linestyle='--', color='orange')
+    plt.plot(est_r_list, est_d_list, label='Kalman Tracker Estimate', marker='^', linestyle='-', color='blue')
+    plt.xlabel('Range Bin')
+    plt.ylabel('Doppler Bin')
+    plt.legend()
+    plt.title('Kalman Tracker Trajectory vs True Target')
+    plt.show()
+
+    # Plot the raw residuals (True vs Estimate and Measurement vs Estimate)
+    plt.plot(residual_true_est_r, label='Residual: True Range - Estimate Range', marker='o', linestyle='-', color='blue')
+    plt.plot(residual_true_est_d, label='Residual: True Doppler - Estimate Doppler', marker='s', linestyle='-', color='cyan')
+    plt.plot(residual_meas_est_r, label='Residual: Measurement Range - Estimate Range', marker='^', linestyle='--', color='orange')
+    plt.plot(residual_meas_est_d, label='Residual: Measurement Doppler - Estimate Doppler', marker='x', linestyle='--', color='magenta')
+    plt.xlabel('Time Step')
+    plt.ylabel('Bin Value')
+    plt.legend()
+    plt.title('Tracking Simulation Residuals: True vs Measured vs Estimated') 
+    plt.show()
+
+if __name__ == "__main__":
+    run_cfar_and_kalman_demo()
+    run_simple_tracker_demo()
+    
