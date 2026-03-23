@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 PASSIVE RADAR PROCESSING
-- NLMS clutter suppression
-- Correlation MP4
-- Range–Doppler CAF MP4 (post-NLMS)
+- NLMS / Wiener / ECA clutter suppression
+- Correlation MP4 (before and after suppression)
+- Range–Doppler CAF MP4 (post-suppression)
 """
 
 import os
@@ -16,9 +16,6 @@ from matplotlib.animation import FuncAnimation, FFMpegWriter
 
 from numba import njit
 from tqdm import tqdm
-
-# User Imports
-from obj_tracking import SimpleTracker, MultiTargetTracker
 
 
 def read_cs8_block(f, n_complex: int):
@@ -39,11 +36,12 @@ def xcorr_fft(a, b):
 
 
 # --------------------------
-# Added: initial offset handling (correlate-style)
+# Initial offset handling
 # --------------------------
 
 def next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
+
 
 def linear_xcorr_fft(x: np.ndarray, y: np.ndarray, nfft: int) -> np.ndarray:
     """
@@ -54,12 +52,14 @@ def linear_xcorr_fft(x: np.ndarray, y: np.ndarray, nfft: int) -> np.ndarray:
     X = np.fft.fft(x, nfft)
     Y = np.fft.fft(y, nfft)
     r_circ = np.fft.ifft(X * np.conj(Y))
-    pos = r_circ[:N]          # lag 0..N-1
-    neg = r_circ[-(N - 1):]   # lag -(N-1)..-1
+    pos = r_circ[:N]
+    neg = r_circ[-(N - 1):]
     return np.concatenate([neg, pos])
+
 
 def file_num_complex_samples(path: str) -> int:
     return os.path.getsize(path) // 2
+
 
 def read_cs8_iq(path: str, start_samp: int, num_samp: int) -> np.ndarray:
     offset_bytes = start_samp * 2
@@ -73,10 +73,13 @@ def read_cs8_iq(path: str, start_samp: int, num_samp: int) -> np.ndarray:
     q = raw[1::2].astype(np.float32)
     return ((i + 1j * q) / 128.0).astype(np.complex64)
 
-def estimate_initial_delay_samples(ref_path: str,
-                                  sur_path: str,
-                                  block_size: int = 32768,
-                                  max_complex_samples: int = 1_000_000) -> int:
+
+def estimate_initial_delay_samples(
+    ref_path: str,
+    sur_path: str,
+    block_size: int = 32768,
+    max_complex_samples: int = 1_000_000,
+) -> int:
     """
     Estimate integer lag (samples) between ref and sur near the start of the files.
     Uses multiple blocks and returns the MODE of peak lags.
@@ -116,10 +119,13 @@ def estimate_initial_delay_samples(ref_path: str,
     mode_lag = int(np.argmax(counts) - offset)
     return mode_lag
 
-def estimate_delay_from_open_files(fx,
-                                   fy,
-                                   block_size: int = 32768,
-                                   max_complex_samples: int = 1_000_000) -> int:
+
+def estimate_delay_from_open_files(
+    fx,
+    fy,
+    block_size: int = 32768,
+    max_complex_samples: int = 1_000_000,
+) -> int:
     """
     Estimate integer lag (samples) between ref and sur using data starting
     from the CURRENT file positions of already-open file handles.
@@ -128,12 +134,10 @@ def estimate_delay_from_open_files(fx,
       - lag < 0 => sur is delayed vs ref by -lag samples
       - lag > 0 => sur leads ref by +lag samples
     """
-    # Save current positions
     pos_x = fx.tell()
     pos_y = fy.tell()
 
     try:
-        # Available complex samples from current positions
         avail_x = (os.fstat(fx.fileno()).st_size - pos_x) // 2
         avail_y = (os.fstat(fy.fileno()).st_size - pos_y) // 2
         usable = min(avail_x, avail_y, max_complex_samples)
@@ -172,7 +176,6 @@ def estimate_delay_from_open_files(fx,
         return mode_lag
 
     finally:
-        # Restore positions so this estimate does not consume data
         fx.seek(pos_x, os.SEEK_SET)
         fy.seek(pos_y, os.SEEK_SET)
 
@@ -196,8 +199,9 @@ def apply_relative_file_shift(fx, fy, lag_samples: int):
     else:
         print("  Applying periodic correction: none (lag=0)")
 
+
 @njit(cache=True)
-def nlms_block(x, d, w, mu, eps):
+def nlms_block(x, d, w, mu, eps, adapt):
     L = w.size
     N = d.size
 
@@ -222,16 +226,17 @@ def nlms_block(x, d, w, mu, eps):
                 p = L - 1
 
         y_hat[n] = y
-        err = d[n] - 0.005*y
+        err = d[n] - y
         e[n] = err
 
-        g = (mu / (norm + eps)) * np.conj(err)
-        p = idx
-        for k in range(L):
-            w[k] += g * xbuf[p]
-            p -= 1
-            if p < 0:
-                p = L - 1
+        if adapt:
+            g = (mu / (norm + eps)) * np.conj(err)
+            p = idx
+            for k in range(L):
+                w[k] += g * xbuf[p]
+                p -= 1
+                if p < 0:
+                    p = L - 1
 
         idx += 1
         if idx == L:
@@ -239,62 +244,67 @@ def nlms_block(x, d, w, mu, eps):
 
     return y_hat, e, w
 
-def wiener_block(x, d, reg=1e-3):
+def wiener_block(x, d, L=32, reg=1e-3, win=None):
     """
-    Drop-in Wiener canceller with:
-      - power-normalized regularization (reg becomes dimensionless)
-      - mild smoothing of H(f) across blocks (persistent internal state)
+    Wiener FIR clutter canceller using:
 
-    Call signature unchanged: wiener_block(x, d, reg)
-    Returns unchanged: y_hat, e, state_dict
+        w    = (R_RR + lambda*I)^(-1) r_RS
+        R_RR = (1/Nv) X^H X
+        r_RS = (1/Nv) X^H d
+
+    where each row of X is:
+        [x[n], x[n-1], ..., x[n-L+1]]
     """
+    x = np.asarray(x, dtype=np.complex64).ravel()
+    d = np.asarray(d, dtype=np.complex64).ravel()
 
-    # --- persistent state stored as function attributes (no wrapper/main changes needed) ---
-    if not hasattr(wiener_block, "_H_prev") or wiener_block._H_prev is None:
-        wiener_block._H_prev = None
 
-    # Smoothing factor (fixed here since you don't want to change wrapper/main)
-    alpha = 0.95   # 0.90..0.98 (higher = smoother, fewer bursts)
 
-    eps = 1e-12
     N = d.size
-    X = np.fft.fft(x, n=N)
-    D = np.fft.fft(d, n=N)
+    L = int(L)
 
-    Sxx = (X * np.conj(X)).real          # |X|^2
-    Sdx = D * np.conj(X)                 # D X*
 
-    # --- power-normalized diagonal loading ---
-    # reg is now dimensionless; effective loading scales with average reference power
-    pxx = float(np.mean(Sxx)) + eps
-    reg_eff = float(reg) * pxx
 
-    H_new = Sdx / (Sxx + reg_eff)
+    Nv = N - L + 1
 
-    # --- smooth across blocks to reduce "bursty" artifacts ---
-    H_prev = wiener_block._H_prev
-    if H_prev is None or H_prev.shape != H_new.shape:
-        H = H_new
-    else:
-        H = alpha * H_prev + (1.0 - alpha) * H_new
+    # Build delayed reference matrix
+    X = np.empty((Nv, L), dtype=np.complex64)
+    for i in range(Nv):
+        n = i + L - 1
+        X[i, :] = x[n - L + 1 : n + 1][::-1]
 
-    wiener_block._H_prev = H.astype(np.complex64)
+    d_valid = d[L - 1:]
 
-    Yhat = np.fft.ifft(H * X).astype(np.complex64)
-    e = (d - Yhat).astype(np.complex64)
 
-    # Return extra debug info (ignored by your pipeline unless you use it)
-    return Yhat, e, {"H": H.astype(np.complex64), "reg_eff": reg_eff, "pxx": pxx, "alpha": alpha}
+    R_RR = (X.conj().T @ X) / Nv
+    r_RS = (X.conj().T @ d_valid) / Nv
 
+    reg_eff = float(reg) * float(np.real(np.trace(R_RR)) / max(L, 1))
+    R_loaded = R_RR + reg_eff * np.eye(L, dtype=np.complex64)
+
+    w = np.linalg.solve(R_loaded, r_RS).astype(np.complex64, copy=False)
+
+    y_valid = (X @ w).astype(np.complex64, copy=False)
+    e_valid = (d_valid - y_valid).astype(np.complex64, copy=False)
+
+    # Keep output same length as input block
+    y_hat = np.zeros(N, dtype=np.complex64)
+    e = d.copy()
+
+    y_hat[L - 1:] = y_valid
+    e[L - 1:] = e_valid
+
+    return y_hat, e, {
+        "w": w,
+        "R_RR": R_RR,
+        "r_RS": r_RS,
+        "reg_eff": reg_eff,
+        "L": L,
+    }
 
 def eca_block(x, d, K=32, delay0=0):
     """
-    Time-domain ECA (Extended Cancellation Algorithm) via least squares.
-    Builds a tap-delay matrix from x and solves min_w ||d - Xmat w||.
-
-    K:     number of taps (columns)
-    delay0: starting delay in samples (>=0). Use delay0>0 to avoid self-leakage at 0 lag.
-    Returns: y_hat, e, state
+    Time-domain ECA via least squares.
     """
     N = d.size
     if delay0 < 0:
@@ -302,11 +312,8 @@ def eca_block(x, d, K=32, delay0=0):
     if K < 1:
         raise ValueError("K must be >= 1")
     if delay0 + K > N:
-        # Not enough samples in this block to build the matrix
         return np.zeros_like(d), d.copy(), {"w": np.zeros(K, dtype=np.complex64)}
 
-    # Build Xmat: each column is a delayed version of x
-    # Xmat[n, k] = x[n - (delay0 + k)]  (with valid indices only)
     Xmat = np.empty((N, K), dtype=np.complex64)
     Xmat[:] = 0.0 + 0.0j
 
@@ -314,7 +321,6 @@ def eca_block(x, d, K=32, delay0=0):
         sh = delay0 + k
         Xmat[sh:, k] = x[: N - sh]
 
-    # Least squares solve (complex)
     w, _, _, _ = np.linalg.lstsq(Xmat, d, rcond=None)
     y_hat = (Xmat @ w).astype(np.complex64)
     e = (d - y_hat).astype(np.complex64)
@@ -323,26 +329,12 @@ def eca_block(x, d, K=32, delay0=0):
 
 
 def clutter_cancel_block(x, d, state, method, params):
-    """
-    Unified clutter canceller wrapper.
-
-    Inputs:
-      x: ref block (complex)
-      d: sur block (complex)
-      state: dict (can be None on first call)
-      method: "nlms" | "wiener" | "eca"
-      params: dict of method-specific params
-
-    Returns:
-      y_hat, e_clean, new_state
-    """
     if state is None:
         state = {}
 
     method = method.lower()
 
     if method == "nlms":
-        # Reuse your existing nlms_block and its weight vector w
         w = state.get("w", None)
         if w is None:
             L = int(params.get("L", 1))
@@ -350,13 +342,24 @@ def clutter_cancel_block(x, d, state, method, params):
 
         mu = float(params.get("mu", 0.1))
         eps = float(params.get("eps", 1e-6))
+        adapt_blocks = int(params.get("adapt_blocks", -1))
 
-        y_hat, e, w = nlms_block(x, d, w, mu, eps)
-        return y_hat, e, {"w": w}
+        block_idx = int(state.get("block_idx", 0))
+        adapt = (adapt_blocks < 0) or (block_idx < adapt_blocks)
+
+        y_hat, e, w = nlms_block(x, d, w, mu, eps, adapt)
+
+        return y_hat, e, {
+            "w": w,
+            "block_idx": block_idx + 1,
+        }
 
     elif method == "wiener":
+        L = int(params.get("L", 32))
         reg = float(params.get("reg", 1e-3))
-        y_hat, e, st = wiener_block(x, d, reg=reg)
+        win = params.get("win", None)
+
+        y_hat, e, st = wiener_block(x, d, L=L, reg=reg, win=win)
         return y_hat, e, st
 
     elif method == "eca":
@@ -368,13 +371,31 @@ def clutter_cancel_block(x, d, state, method, params):
     else:
         raise ValueError(f"Unknown method '{method}'. Use 'nlms', 'wiener', or 'eca'.")
 
+
 def save_correlation_mp4(x_axis_m, before_frames, after_frames, out_path, fps):
     fig, ax = plt.subplots(figsize=(7, 7))
-    (l1,) = ax.plot([], [], label="Before NLMS")
-    (l2,) = ax.plot([], [], label="After NLMS")
+    (l1,) = ax.plot([], [], label="Before suppression")
+    (l2,) = ax.plot([], [], label="After suppression")
 
-    ax.set_xlim(-500, 500)
-    ax.set_ylim(-20, 200000)
+    ax.set_xlim(float(x_axis_m[0]), float(x_axis_m[-1]))
+
+    all_vals = []
+    if len(before_frames) > 0:
+        all_vals.append(np.concatenate(before_frames))
+    if len(after_frames) > 0:
+        all_vals.append(np.concatenate(after_frames))
+
+    if len(all_vals) == 0:
+        y_min, y_max = -120.0, 0.0
+    else:
+        all_vals = np.concatenate(all_vals)
+        y_min = float(np.min(all_vals))
+        y_max = float(np.max(all_vals))
+        if y_max - y_min < 1.0:
+            y_min -= 1.0
+            y_max += 1.0
+
+    ax.set_ylim(y_min, y_max)
     ax.set_xlabel("Range (m, approx from lag)")
     ax.set_ylabel("Correlation (dB)")
     ax.legend()
@@ -383,7 +404,7 @@ def save_correlation_mp4(x_axis_m, before_frames, after_frames, out_path, fps):
     def upd(i):
         l1.set_data(x_axis_m, before_frames[i])
         l2.set_data(x_axis_m, after_frames[i])
-        ax.set_title(f"Correlation Block {i+1}")
+        ax.set_title(f"Correlation Block {i + 1}/{len(before_frames)}")
         return l1, l2
 
     FuncAnimation(fig, upd, frames=len(before_frames), blit=True).save(
@@ -392,70 +413,49 @@ def save_correlation_mp4(x_axis_m, before_frames, after_frames, out_path, fps):
     plt.close(fig)
 
 
-def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None, show_cfar=True):
-    """
-    Builds Range–Doppler CAF frames from caf_corr (list of complex correlation vectors)
-    and saves an MP4 without storing all frames in memory.
-
-    Behavior:
-      - sliding window of Nslow
-      - FFT over slow-time axis
-      - fftshift
-      - Doppler crop
-      - dB magnitude
-    """
+def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps):
     if len(caf_corr) < Nslow:
         print(f"Not enough blocks for CAF: have {len(caf_corr)}, need Nslow={Nslow}. Skipping CAF MP4.")
         return
 
     doppler_axis = np.fft.fftshift(np.fft.fftfreq(Nslow, d=Tblock))
 
-    # Doppler zoom to +/- 60 Hz
-    MAX_DOPPLER_HZ = 60.0
+    MAX_DOPPLER_HZ = 80.0
     dmask = np.abs(doppler_axis) <= MAX_DOPPLER_HZ
     doppler_zoom = doppler_axis[dmask]
 
-    n_caf_frames = len(caf_corr) - Nslow + 1
-    frame_step = 5  # keep every 10th frame in the video
+    zero_bin = np.argmin(np.abs(doppler_zoom))
+    print("Zero-Doppler bin:", zero_bin, "freq:", doppler_zoom[zero_bin], "Hz")
 
-    # Build first frame so we can initialize imshow
+    n_caf_frames = len(caf_corr) - Nslow + 1
+    frame_step = 1
+
     S0 = np.stack(caf_corr[0:Nslow], axis=0)
     RD0 = np.fft.fftshift(np.fft.fft(S0, axis=0), axes=0)
     RD0 = RD0[dmask, :]
-    frame0 = (20 * np.log10(np.abs(RD0) + 1e-12)).astype(np.float32)
+
+    lo0 = max(0, zero_bin - 4)
+    hi0 = min(RD0.shape[0], zero_bin + 6)
+    RD0[lo0:hi0, :] = 0
+
+    frame0 = 20 * np.log10(np.abs(RD0) + 1e-12)
+    frame0 -= np.max(frame0)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     extent = [x_axis_m[0], x_axis_m[-1], doppler_zoom[0], doppler_zoom[-1]]
 
     im = ax.imshow(
-        frame0,
+        frame0.astype(np.float32),
         origin="lower",
         aspect="auto",
         extent=extent,
+        vmin=-15.0,
+        vmax=0.0,
     )
 
     ax.set_xlabel("Range (m, approx from lag)")
     ax.set_ylabel("Doppler (Hz)")
-    ax.set_title("Range–Doppler CAF (After NLMS)")
-
-    # Kalman Filter Outputs and Options
-    cfar_scatter, = ax.plot([], [], 'kx', markersize=4, alpha=0.8, zorder=4, label='Raw CFAR') #CFAR layer
-    
-    track_lines = {}  # Will hold {'point': Line2D, 'vector': Line2D} for each active track ID
-    # High-contrast colors designed to pop against the dark purple/green heatmap
-    palette = ['#FF0000', '#00FF00', '#00FFFF', '#FF00FF', '#FFA500', '#FFFF00', '#1E90FF']
-
-    '''
-    # old simple single-tracker implementation. for multiple tracks, we use the dict above.
-    tracker_point, = ax.plot([], [], 'ro', markersize=6, markeredgewidth=3, label='Kalman Track')
-    
-    tracker_vector, = ax.plot([], [], 'r-', linewidth=2, label='Rate Vector') # optional: rate "line" vector
-    #tracker_vector = ax.quiver([0.0], [0.0], [0.0], [0.0], color='r', scale=1, scale_units='xy', angles='xy', width=0.005, zorder=5, label='Rate Vector') # optional: rate vector using quiver NOTE: Quiver is not functional
-    ax.legend(loc="upper right")
-    '''
-    
-    ax.plot([], [], 'ro', markerfacecolor='none', label='Kalman Tracks')
-    ax.legend(loc="upper right")
+    ax.set_title("Range–Doppler CAF (After suppression)")
 
     writer = FFMpegWriter(fps=fps)
 
@@ -467,148 +467,75 @@ def save_caf_mp4(caf_corr, x_axis_m, Nslow, Tblock, out_path, fps, tracker=None,
         ):
             S = np.stack(caf_corr[i - (Nslow - 1): i + 1], axis=0)
             RD = np.fft.fftshift(np.fft.fft(S, axis=0), axes=0)
-            RD = RD[dmask, :]  # crop Doppler
+            RD = RD[dmask, :]
+
+            lo = max(0, zero_bin -4)
+            hi = min(RD.shape[0], zero_bin+6)
+            RD[lo:hi, :] = 0
+
+            frame_db = 20 * np.log10(np.abs(RD) + 1e-12)
+            #print(np.max(frame_db))
+            frame_db -= np.max(frame_db)
             
-            # Genearte visual frame (db)
-            frame_db = (20 * np.log10(np.abs(RD) + 1e-12)).astype(np.float32)
 
-            im.set_data(frame_db)
-
-            # run tracker logic
-            if tracker is not None:
-                caf_power = np.abs(RD.T)**2 
-                d_zero_idx = int(np.argmin(np.abs(doppler_zoom)))
-                
-                track_res = tracker.process_caf_frame(caf_power, i, doppler_0_idx=d_zero_idx)
-                
-                # --- BACKWARDS COMPATIBILITY ADAPTER ---
-                active_tracks = []
-                if 'tracks' in track_res:
-                    # MultiTargetTracker output
-                    active_tracks = track_res['tracks']
-                elif track_res.get('active', False):
-                    # SimpleTracker output (wrap it to look like a MultiTarget track)
-                    active_tracks = [{'track_id': 0, **track_res['state']}]
-
-                # --- PLOT CFAR SHOTGUN ---
-                if show_cfar and len(track_res.get('raw_detections', [])) > 0:
-                    raw_dets = track_res['raw_detections']
-                    c = 299_792_458.0
-                    fs = tracker.fs
-                    r_m_arr = (raw_dets[:, 0] / fs * c) / 2.0
-                    d_hz_arr = (raw_dets[:, 1] - d_zero_idx) * (1.0 / (Nslow * Tblock))
-                    cfar_scatter.set_data(r_m_arr, d_hz_arr)
-                else:
-                    cfar_scatter.set_data([], [])
-
-                # --- PLOT COLOR-CODED TRACKS ---
-                current_ids = set()
-                span_r = x_axis_m[-1] - x_axis_m[0]
-                span_d = doppler_zoom[-1] - doppler_zoom[0]
-                
-                for t in active_tracks:
-                    tid = t['track_id']
-                    current_ids.add(tid)
-                    
-                    # If this is a newly spawned track, create line objects for it
-                    if tid not in track_lines:
-                        color = palette[tid % len(palette)]
-                        p_line, = ax.plot([], [], marker='o', color=color, markersize=8, 
-                                          markeredgewidth=2, markerfacecolor='none', linestyle='None', zorder=5)
-                        v_line, = ax.plot([], [], '-', color=color, linewidth=2, zorder=5)
-                        track_lines[tid] = {'point': p_line, 'vector': v_line}
-                    
-                    # Get physics state
-                    r_m = t['bistatic_range_m']
-                    d_hz = t['doppler_hz']
-                    rdot = t['range_rate_m_s']
-                    ddot = t['doppler_rate_hz_s']
-                    
-                    # Aspect Ratio Scale Math
-                    frac_rdot = rdot / span_r
-                    frac_ddot = ddot / span_d
-                    screen_mag = np.hypot(frac_rdot, frac_ddot)
-                    scale_mag = 0.1
-                    threshold_mag = 1e-6 # avoid division by zero and excessively long vectors for very slow targets
-                    t_scale = scale_mag / screen_mag if screen_mag > threshold_mag else 0.0
-                        
-                    end_r = r_m + (rdot * t_scale)
-                    end_d = d_hz + (ddot * t_scale)
-                    
-                    # Update this specific track's lines
-                    track_lines[tid]['point'].set_data([r_m], [d_hz])
-                    track_lines[tid]['vector'].set_data([r_m, end_r], [d_hz, end_d])
-                
-                # --- MEMORY MANAGEMENT: DELETE DEAD TRACKS ---
-                for tid in list(track_lines.keys()):
-                    if tid not in current_ids:
-                        # Remove the line objects from the matplotlib axes entirely
-                        track_lines[tid]['point'].remove()
-                        track_lines[tid]['vector'].remove()
-                        # Delete from our tracking dictionary
-                        del track_lines[tid]
-                    
+            im.set_data(frame_db.astype(np.float32))
             writer.grab_frame()
 
     plt.close(fig)
 
+
 def main():
-    fid_x_path = "/Users/colekim/Documents/Y4_Work/Capstone/all_recordings/12_54_51/9f_509.0MHz_15.0MSPS_20260314_125451.cs8"
-    fid_y_path = "/Users/colekim/Documents/Y4_Work/Capstone/all_recordings/12_54_51/63_509.0MHz_15.0MSPS_20260314_125451.cs8"
+    date = "bev"
+    fid_x_path = "/Users/ibrahimsweidan/Downloads/10_509.0MHz_20260310_193719/ref.cs8"
+    fid_y_path = "/Users/ibrahimsweidan/Downloads/10_509.0MHz_20260310_193719/sur.cs8"
     if not os.path.exists(fid_x_path):
         raise FileNotFoundError("Input file not found")
 
-    cpi = 0.5 
-    length = 32*1024
-    Fs = 15e6
+    cpi = 0.5
+    length = 32 * 1024
+    Fs = 10e6
     Nslow = int(cpi * Fs / length)
-    L = 80
-    mu = 0.1
-    eps = 1e-6
+    print(Nslow)
 
-    CANCEL_METHOD = "nlms"   # "nlms" | "wiener" | "eca"
+    win = np.hanning(length).astype(np.float32)
+
+    CANCEL_METHOD = "wiener"   # "nlms" | "wiener" | "eca"
 
     cancel_params = {
         # NLMS params
-        "L": L,
-        "mu": mu,
-        "eps": eps,
+        "L": 30,
+        "mu": 0.1,
+        "eps": 1e-6,
+        "adapt_blocks": -1,
 
-        # Wiener params (only used if method=="wiener")
+        # Wiener params
+        "L": 15,
         "reg": 1e-2,
+        "win": win,
 
-        # ECA params (only used if method=="eca")
-        "K": 3,
+        # ECA params
+        "K": 15,
         "delay0": 0,
     }
 
     cancel_state = None
 
-
-    fps = 1000
     corr_mp4 = "PassiveRadar_Correlation.mp4"
-    caf_mp4 = "PassiveRadar_RangeDoppler_CAF.mp4"
+    caf_mp4 = date + CANCEL_METHOD + ".mp4"
 
-    # Re-check offset about once per second of data
-    seconds_per_recheck = 1.0
+    seconds_per_recheck = 1
     blocks_per_recheck = max(1, int(round(seconds_per_recheck * Fs / length)))
 
-    # Use ~1 second of data for the offset estimator too
     recheck_window_samples = int(Fs * 1.0)
     recheck_corr_block_size = 32768
-
-    # Optional: ignore tiny jittery corrections
     min_recheck_shift_samples = 2
 
-    # Added: fast-time Hann window for correlation
-    win = np.hanning(length).astype(np.float32)
-
-    w = np.zeros(L, dtype=np.complex64)
     R_after_cplx = []
+    R_before_db = []
+    R_after_db = []
 
     Tblock = length / Fs
 
-    # --- Estimate & apply initial file offset ---
     lag0 = estimate_initial_delay_samples(fid_x_path, fid_y_path)
     ref_off = max(0, lag0)
     sur_off = max(0, -lag0)
@@ -621,7 +548,6 @@ def main():
     else:
         print("Applying correction: none (lag=0)")
 
-    # Cap max_record to available full blocks after initial offsets
     n_ref = file_num_complex_samples(fid_x_path) - ref_off
     n_sur = file_num_complex_samples(fid_y_path) - sur_off
     n_avail = min(n_ref, n_sur)
@@ -630,7 +556,6 @@ def main():
         raise RuntimeError("No full blocks available after applying initial offset.")
 
     with open(fid_x_path, "rb") as fx, open(fid_y_path, "rb") as fy:
-        # Apply initial offset
         if ref_off:
             fx.seek(ref_off * 2, os.SEEK_SET)
         if sur_off:
@@ -638,8 +563,7 @@ def main():
 
         bi = 0
         with tqdm(total=max_blocks, desc="Processing blocks") as pbar:
-            while True:
-                # Periodic offset re-check
+            while bi < max_blocks:
                 if bi > 0 and (bi % blocks_per_recheck == 0):
                     lag_now = estimate_delay_from_open_files(
                         fx,
@@ -670,11 +594,14 @@ def main():
                     x, y, cancel_state, CANCEL_METHOD, cancel_params
                 )
 
-                # Apply Hann window before correlation
-                xw = x 
-                yw = y_clean 
+                xw = x
+                yw = y_clean
 
-                Ra = xcorr_fft(yw, xw)
+                Rb = xcorr_fft(y, xw)    # before suppression
+                Ra = xcorr_fft(yw, xw)   # after suppression
+
+                R_before_db.append(20 * np.log10(np.abs(Rb) + 1e-12))
+                R_after_db.append(20 * np.log10(np.abs(Ra) + 1e-12))
                 R_after_cplx.append(Ra.astype(np.complex64))
 
                 bi += 1
@@ -683,22 +610,28 @@ def main():
     if len(R_after_cplx) == 0:
         raise RuntimeError("No processed blocks produced any CAF data.")
 
-    # --- Convert lag axis -> range (meters), and crop to 0..1000 m ---
     c = 299_792_458.0
     lags_s = np.arange(-(length - 1), length) / Fs
     range_m = c * lags_s / 2.0
 
-    mask = (range_m >= 0.0) & (range_m <= 1000.0)
+    mask = (range_m >= 0.0) & (range_m <= 200.0)
     x_crop = range_m[mask]
 
-    caf_corr = []
-    for k in range(len(R_after_cplx)):
-        caf_corr.append(R_after_cplx[k][mask])
-    
-    # Instantiate a tracker and pass it to the CAF MP4 generator
-    #target_tracker = SimpleTracker(fs=Fs, N=Nslow, fc=509e6, Tblock=Tblock)
-    target_tracker = MultiTargetTracker(fs=Fs, N=Nslow, fc=509e6, Tblock=Tblock, pfa=1e-6, association_threshold=3)
-    save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps, tracker=target_tracker, show_cfar=True)
+    caf_corr = [R_after_cplx[k][mask] for k in range(len(R_after_cplx))]
+
+    if len(caf_corr) < Nslow:
+        raise RuntimeError(f"Not enough CAF blocks: have {len(caf_corr)}, need {Nslow}")
+
+    fps = (len(caf_corr) - Nslow + 1) / (len(caf_corr) * length / Fs)
+
+    save_caf_mp4(caf_corr, x_crop, Nslow, Tblock, caf_mp4, fps)
+
+    mask = (range_m >= -512.0) & (range_m <= 512.0)
+    x_crop = range_m[mask]
+    before_frames = [R_before_db[k][mask] for k in range(len(R_before_db))]
+    after_frames = [R_after_db[k][mask] for k in range(len(R_after_db))]
+
+    save_correlation_mp4(x_crop, before_frames, after_frames, corr_mp4, fps)
 
     print("Finished:")
     print(" ", corr_mp4)
